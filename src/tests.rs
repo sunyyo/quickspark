@@ -1,4 +1,7 @@
-use super::{alt_shortcut_index, catch_index_panic, hotkey_candidates, wheel_selection_delta};
+use super::{
+    alt_shortcut_index, app_cell, catch_index_panic, hotkey_candidates, try_with_state,
+    try_with_state_mut, wheel_selection_delta,
+};
 use crate::{
     model::{Action, Query, Usage},
     providers::{
@@ -14,11 +17,37 @@ use crate::{
     storage::{HotkeyChoice, Settings, load_usage_from, save_usage_to},
 };
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
+
+#[test]
+fn checked_state_access_rejects_reentrant_aliases_without_panicking() {
+    let state = RefCell::new(1usize);
+
+    let nested_read = try_with_state_mut(&state, |value| {
+        *value += 1;
+        try_with_state(&state, |nested| *nested)
+    });
+    assert_eq!(nested_read, Some(None));
+
+    let nested_write = try_with_state(&state, |_| {
+        try_with_state_mut(&state, |nested| *nested += 1)
+    });
+    assert_eq!(nested_write, Some(None));
+
+    assert_eq!(try_with_state(&state, |value| *value), Some(2));
+    assert_eq!(try_with_state_mut(&state, |value| *value += 1), Some(()));
+    assert_eq!(try_with_state(&state, |value| *value), Some(3));
+}
+
+#[test]
+fn null_window_has_no_application_state() {
+    assert!(unsafe { app_cell(std::ptr::null_mut()) }.is_none());
+}
 use windows_sys::Win32::UI::WindowsAndMessaging::{WM_KEYDOWN, WM_SYSKEYDOWN};
 
 #[test]

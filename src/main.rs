@@ -8,9 +8,10 @@ mod search;
 mod storage;
 
 use std::{
+    cell::RefCell,
     collections::{HashMap, HashSet},
     os::windows::ffi::OsStrExt,
-    ptr::{null, null_mut},
+    ptr::{NonNull, null, null_mut},
     sync::{
         OnceLock,
         mpsc::{self, Receiver, Sender},
@@ -174,21 +175,34 @@ fn wide(s: &str) -> Vec<u16> {
         .collect()
 }
 
-unsafe fn app_ptr(hwnd: HWND) -> *mut App {
-    unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App }
+type AppCell = RefCell<App>;
+
+fn try_with_state<T, R>(state: &RefCell<T>, access: impl FnOnce(&T) -> R) -> Option<R> {
+    let state = state.try_borrow().ok()?;
+    Some(access(&state))
 }
 
-macro_rules! app_state {
-    ($hwnd:expr) => {{
-        #[allow(unused_unsafe)]
-        unsafe {
-            &mut *app_ptr($hwnd)
-        }
-    }};
+fn try_with_state_mut<T, R>(state: &RefCell<T>, access: impl FnOnce(&mut T) -> R) -> Option<R> {
+    let mut state = state.try_borrow_mut().ok()?;
+    Some(access(&mut state))
+}
+
+unsafe fn app_cell(hwnd: HWND) -> Option<NonNull<AppCell>> {
+    NonNull::new(unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut AppCell })
+}
+
+unsafe fn with_app<R>(hwnd: HWND, access: impl FnOnce(&App) -> R) -> Option<R> {
+    let pointer = unsafe { app_cell(hwnd) }?;
+    try_with_state(unsafe { pointer.as_ref() }, access)
+}
+
+unsafe fn with_app_mut<R>(hwnd: HWND, access: impl FnOnce(&mut App) -> R) -> Option<R> {
+    let pointer = unsafe { app_cell(hwnd) }?;
+    try_with_state_mut(unsafe { pointer.as_ref() }, access)
 }
 
 unsafe fn has_app(hwnd: HWND) -> bool {
-    unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) != 0 }
+    unsafe { app_cell(hwnd).is_some() }
 }
 
 unsafe fn query(edit: HWND) -> String {
@@ -201,7 +215,9 @@ unsafe fn query(edit: HWND) -> String {
 }
 
 unsafe fn set_launcher_query(hwnd: HWND, value: &str) {
-    let edit = app_state!(hwnd).edit;
+    let Some(edit) = (unsafe { with_app(hwnd, |state| state.edit) }) else {
+        return;
+    };
     unsafe {
         SetWindowTextW(edit, wide(value).as_ptr());
         let end = value.encode_utf16().count();
@@ -211,27 +227,32 @@ unsafe fn set_launcher_query(hwnd: HWND, value: &str) {
 }
 
 unsafe fn refresh(hwnd: HWND) {
-    let edit = app_state!(hwnd).edit;
+    let Some(edit) = (unsafe { with_app(hwnd, |state| state.edit) }) else {
+        return;
+    };
     let input = unsafe { query(edit) };
     let query = Query::new(&input);
-    let (list, titles) = {
-        let state = app_state!(hwnd);
-        let context = ProviderContext {
-            usage: &state.usage,
-            now: now_seconds(),
-            settings: &state.settings,
-            pinned: &state.pinned,
-            light_theme: state.light_theme,
-        };
-        state.results = state
-            .providers
-            .query(&query, &context, state.settings.result_limit);
-        let titles = state
-            .results
-            .iter()
-            .map(|result| result.title.clone())
-            .collect::<Vec<_>>();
-        (state.list, titles)
+    let Some((list, titles)) = (unsafe {
+        with_app_mut(hwnd, |state| {
+            let context = ProviderContext {
+                usage: &state.usage,
+                now: now_seconds(),
+                settings: &state.settings,
+                pinned: &state.pinned,
+                light_theme: state.light_theme,
+            };
+            state.results = state
+                .providers
+                .query(&query, &context, state.settings.result_limit);
+            let titles = state
+                .results
+                .iter()
+                .map(|result| result.title.clone())
+                .collect::<Vec<_>>();
+            (state.list, titles)
+        })
+    }) else {
+        return;
     };
 
     unsafe { SendMessageW(list, LB_RESETCONTENT, 0, 0) };
@@ -252,22 +273,32 @@ unsafe fn launch_selected(hwnd: HWND) {
 }
 
 unsafe fn launch_result(hwnd: HWND, position: usize) {
-    let action = app_state!(hwnd)
-        .results
-        .get(position)
-        .and_then(ResultItem::primary_action)
-        .cloned();
+    let action = unsafe {
+        with_app(hwnd, |state| {
+            state
+                .results
+                .get(position)
+                .and_then(ResultItem::primary_action)
+                .cloned()
+        })
+    }
+    .flatten();
     if let Some(action) = action {
         unsafe { execute_action(hwnd, action) };
     }
 }
 
 unsafe fn launch_result_action(hwnd: HWND, position: usize, action_position: usize) {
-    let action = app_state!(hwnd)
-        .results
-        .get(position)
-        .and_then(|result| result.actions.get(action_position))
-        .cloned();
+    let action = unsafe {
+        with_app(hwnd, |state| {
+            state
+                .results
+                .get(position)
+                .and_then(|result| result.actions.get(action_position))
+                .cloned()
+        })
+    }
+    .flatten();
     let Some(action) = action else {
         return;
     };
@@ -367,18 +398,28 @@ unsafe fn execute_action(hwnd: HWND, action: Action) {
             return;
         }
         Action::SetPinned { key, pinned } => {
-            let state = app_state!(hwnd);
-            if pinned {
-                state.pinned.insert(key.clone());
-            } else {
-                state.pinned.remove(&key);
-            }
-            if !save_pinned(&state.pinned) {
-                if pinned {
-                    state.pinned.remove(&key);
-                } else {
-                    state.pinned.insert(key);
-                }
+            let Some(snapshot) = (unsafe {
+                with_app_mut(hwnd, |state| {
+                    if pinned {
+                        state.pinned.insert(key.clone());
+                    } else {
+                        state.pinned.remove(&key);
+                    }
+                    state.pinned.clone()
+                })
+            }) else {
+                return;
+            };
+            if !save_pinned(&snapshot) {
+                let _ = unsafe {
+                    with_app_mut(hwnd, |state| {
+                        if pinned {
+                            state.pinned.remove(&key);
+                        } else {
+                            state.pinned.insert(key);
+                        }
+                    })
+                };
                 unsafe {
                     show_action_error(hwnd, "无法保存固定项目，已撤销本次更改。")
                 };
@@ -392,16 +433,23 @@ unsafe fn execute_action(hwnd: HWND, action: Action) {
         }
         Action::SystemCommand { command } => unsafe { execute_system_command(hwnd, command) },
         Action::AskAi { request } | Action::RegenerateAi { request } => {
-            let previous_window = {
-                let state = app_state!(hwnd);
-                state.ai_service.cancel();
-                let window = state.ai_window;
-                state.ai_window = null_mut();
-                state.ai_generation = 0;
-                window
+            let Some(previous_window) = (unsafe {
+                with_app_mut(hwnd, |state| {
+                    state.ai_service.cancel();
+                    let window = state.ai_window;
+                    state.ai_window = null_mut();
+                    state.ai_generation = 0;
+                    window
+                })
+            }) else {
+                return;
             };
             close_ai_answer(previous_window);
-            let generation = app_state!(hwnd).ai_service.ask(request.clone());
+            let Some(generation) =
+                (unsafe { with_app_mut(hwnd, |state| state.ai_service.ask(request.clone())) })
+            else {
+                return;
+            };
             let Some(answer_window) = show_ai_stream(
                 hwnd,
                 &request.display_prompt,
@@ -409,25 +457,33 @@ unsafe fn execute_action(hwnd: HWND, action: Action) {
                 AI_WINDOW_CLOSED,
                 generation,
             ) else {
-                app_state!(hwnd).ai_service.cancel();
+                let _ = unsafe { with_app_mut(hwnd, |state| state.ai_service.cancel()) };
                 unsafe { show_action_error(hwnd, "无法打开 AI 回答窗口。") };
                 unsafe { refresh(hwnd) };
                 return;
             };
-            {
-                let state = app_state!(hwnd);
-                state.ai_window = answer_window;
-                state.ai_generation = generation;
+            let updated = unsafe {
+                with_app_mut(hwnd, |state| {
+                    state.ai_window = answer_window;
+                    state.ai_generation = generation;
+                })
+            };
+            if updated.is_none() {
+                close_ai_answer(answer_window);
+                return;
             }
             unsafe { ShowWindow(hwnd, SW_HIDE) };
             unsafe { refresh(hwnd) };
             return;
         }
         Action::CancelAi => {
-            let answer_window = {
-                let state = app_state!(hwnd);
-                state.ai_service.cancel();
-                state.ai_window
+            let Some(answer_window) = (unsafe {
+                with_app_mut(hwnd, |state| {
+                    state.ai_service.cancel();
+                    state.ai_window
+                })
+            }) else {
+                return;
             };
             cancel_ai_answer(answer_window);
             unsafe { refresh(hwnd) };
@@ -473,11 +529,17 @@ unsafe fn execute_action(hwnd: HWND, action: Action) {
         return;
     }
     if let Some(key) = usage_key {
-        let state = app_state!(hwnd);
-        let record = state.usage.entry(key).or_default();
-        record.count = record.count.saturating_add(1);
-        record.last = now_seconds();
-        save_usage(&state.usage);
+        let snapshot = unsafe {
+            with_app_mut(hwnd, |state| {
+                let record = state.usage.entry(key).or_default();
+                record.count = record.count.saturating_add(1);
+                record.last = now_seconds();
+                state.usage.clone()
+            })
+        };
+        if let Some(snapshot) = snapshot {
+            save_usage(&snapshot);
+        }
     }
     unsafe { ShowWindow(hwnd, SW_HIDE) };
 }
@@ -494,7 +556,7 @@ unsafe fn show_action_error(hwnd: HWND, message: &str) {
 }
 
 unsafe fn selected_result_position(hwnd: HWND) -> Option<usize> {
-    let list = app_state!(hwnd).list;
+    let list = unsafe { with_app(hwnd, |state| state.list) }?;
     let selected = unsafe { SendMessageW(list, LB_GETCURSEL, 0, 0) } as i32;
     (selected >= 0).then_some(selected as usize)
 }
@@ -503,10 +565,15 @@ unsafe fn launch_selected_matching(hwnd: HWND, matches: fn(&Action) -> bool) -> 
     let Some(position) = (unsafe { selected_result_position(hwnd) }) else {
         return false;
     };
-    let action_position = app_state!(hwnd)
-        .results
-        .get(position)
-        .and_then(|result| result.actions.iter().position(matches));
+    let action_position = unsafe {
+        with_app(hwnd, |state| {
+            state
+                .results
+                .get(position)
+                .and_then(|result| result.actions.iter().position(matches))
+        })
+    }
+    .flatten();
     let Some(action_position) = action_position else {
         return false;
     };
@@ -518,15 +585,22 @@ unsafe fn show_result_actions(hwnd: HWND) {
     let Some(position) = (unsafe { selected_result_position(hwnd) }) else {
         return;
     };
-    let mut actions = app_state!(hwnd)
-        .results
-        .get(position)
-        .map(|result| result.actions.clone())
-        .unwrap_or_default();
-    if let Some(key) = actions.first().and_then(Action::favorite_key) {
-        let pinned = !app_state!(hwnd).pinned.contains(&key);
-        actions.push(Action::SetPinned { key, pinned });
-    }
+    let Some((actions, dpi)) = (unsafe {
+        with_app(hwnd, |state| {
+            let mut actions = state
+                .results
+                .get(position)
+                .map(|result| result.actions.clone())
+                .unwrap_or_default();
+            if let Some(key) = actions.first().and_then(Action::favorite_key) {
+                let pinned = !state.pinned.contains(&key);
+                actions.push(Action::SetPinned { key, pinned });
+            }
+            (actions, state.dpi)
+        })
+    }) else {
+        return;
+    };
     if actions.len() <= 1 {
         return;
     }
@@ -547,7 +621,6 @@ unsafe fn show_result_actions(hwnd: HWND) {
 
     let mut rect: RECT = unsafe { std::mem::zeroed() };
     unsafe { GetWindowRect(hwnd, &mut rect) };
-    let dpi = app_state!(hwnd).dpi;
     let command = unsafe {
         TrackPopupMenu(
             menu,
@@ -620,15 +693,17 @@ fn wheel_selection_delta(wparam: WPARAM) -> i32 {
 }
 
 unsafe fn move_selection(hwnd: HWND, delta: i32) {
-    let state = app_state!(hwnd);
-    let count = unsafe { SendMessageW(state.list, LB_GETCOUNT, 0, 0) } as i32;
+    let Some(list) = (unsafe { with_app(hwnd, |state| state.list) }) else {
+        return;
+    };
+    let count = unsafe { SendMessageW(list, LB_GETCOUNT, 0, 0) } as i32;
     if count <= 0 {
         return;
     }
-    let current = unsafe { SendMessageW(state.list, LB_GETCURSEL, 0, 0) } as i32;
+    let current = unsafe { SendMessageW(list, LB_GETCURSEL, 0, 0) } as i32;
     let next = (current + delta).clamp(0, count - 1);
-    unsafe { SendMessageW(state.list, LB_SETCURSEL, next as WPARAM, 0) };
-    let top = unsafe { SendMessageW(state.list, LB_GETTOPINDEX, 0, 0) } as i32;
+    unsafe { SendMessageW(list, LB_SETCURSEL, next as WPARAM, 0) };
+    let top = unsafe { SendMessageW(list, LB_GETTOPINDEX, 0, 0) } as i32;
     let visible_count = VISIBLE_RESULT_COUNT as i32;
     let new_top = if next < top {
         next
@@ -638,17 +713,24 @@ unsafe fn move_selection(hwnd: HWND, delta: i32) {
         top
     };
     if new_top != top {
-        unsafe { SendMessageW(state.list, LB_SETTOPINDEX, new_top as WPARAM, 0) };
+        unsafe { SendMessageW(list, LB_SETTOPINDEX, new_top as WPARAM, 0) };
     }
 }
 
 unsafe fn start_index_refresh(hwnd: HWND) {
-    let state = app_state!(hwnd);
-    if state.indexing {
-        return;
+    let sender = unsafe {
+        with_app_mut(hwnd, |state| {
+            if state.indexing {
+                return None;
+            }
+            state.indexing = true;
+            Some(state.index_tx.clone())
+        })
     }
-    state.indexing = true;
-    let sender = state.index_tx.clone();
+    .flatten();
+    let Some(sender) = sender else {
+        return;
+    };
     let hwnd_value = hwnd as usize;
     thread::spawn(move || {
         let result = catch_index_panic(ApplicationProvider::build);
@@ -674,12 +756,16 @@ unsafe fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
     data.uCallbackMessage = TRAY_MESSAGE;
     data.hIcon = unsafe { application_icon() };
     let hotkey = if unsafe { has_app(hwnd) } {
-        let state = app_state!(hwnd);
-        if state.hotkey_registered {
-            state.settings.hotkey.label()
-        } else {
-            "快捷键不可用"
+        unsafe {
+            with_app(hwnd, |state| {
+                if state.hotkey_registered {
+                    state.settings.hotkey.label()
+                } else {
+                    "快捷键不可用"
+                }
+            })
         }
+        .unwrap_or("快捷键不可用")
     } else {
         HotkeyChoice::AltSpace.label()
     };
@@ -701,7 +787,7 @@ unsafe fn application_icon() -> HICON {
 }
 
 unsafe fn apply_dpi(hwnd: HWND, dpi: u32) {
-    if app_state!(hwnd).dpi == dpi {
+    if unsafe { with_app(hwnd, |state| state.dpi == dpi) }.unwrap_or(true) {
         return;
     }
     let face = wide("Microsoft YaHei UI");
@@ -750,13 +836,21 @@ unsafe fn apply_dpi(hwnd: HWND, dpi: u32) {
         }
         return;
     }
-    let (edit, list, old_font, old_shortcut_font) = {
-        let state = app_state!(hwnd);
-        let old = (state.edit, state.list, state.font, state.shortcut_font);
-        state.font = font;
-        state.shortcut_font = shortcut_font;
-        state.dpi = dpi;
-        old
+    let swapped = unsafe {
+        with_app_mut(hwnd, |state| {
+            let old = (state.edit, state.list, state.font, state.shortcut_font);
+            state.font = font;
+            state.shortcut_font = shortcut_font;
+            state.dpi = dpi;
+            old
+        })
+    };
+    let Some((edit, list, old_font, old_shortcut_font)) = swapped else {
+        unsafe {
+            DeleteObject(font as _);
+            DeleteObject(shortcut_font as _);
+        }
+        return;
     };
     unsafe {
         SendMessageW(edit, WM_SETFONT, font as WPARAM, 1);
@@ -800,7 +894,10 @@ unsafe fn show_launcher(hwnd: HWND) {
     let mut dpi_x = 96u32;
     let mut dpi_y = 96u32;
     if unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) } < 0 {
-        dpi_x = app_state!(hwnd).dpi;
+        let Some(current_dpi) = (unsafe { with_app(hwnd, |state| state.dpi) }) else {
+            return;
+        };
+        dpi_x = current_dpi;
     }
     unsafe { apply_dpi(hwnd, dpi_x) };
     let dpi = dpi_x;
@@ -816,7 +913,9 @@ unsafe fn show_launcher(hwnd: HWND) {
         SetWindowPos(hwnd, HWND_TOPMOST, x, y, width, height, SWP_SHOWWINDOW);
         SetForegroundWindow(hwnd)
     };
-    let edit = app_state!(hwnd).edit;
+    let Some(edit) = (unsafe { with_app(hwnd, |state| state.edit) }) else {
+        return;
+    };
     unsafe {
         SetWindowTextW(edit, wide("").as_ptr());
         SetFocus(edit)
@@ -839,6 +938,11 @@ unsafe fn show_settings(hwnd: HWND) {
 }
 
 unsafe fn show_tray_menu(hwnd: HWND) {
+    let checked = if unsafe { with_app(hwnd, |state| state.light_theme) }.unwrap_or(false) {
+        MF_CHECKED
+    } else {
+        0
+    };
     let menu = unsafe { CreatePopupMenu() };
     if menu.is_null() {
         return;
@@ -848,11 +952,6 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         AppendMenuW(menu, MF_STRING, MENU_HELP, wide("使用说明\tF1").as_ptr());
         AppendMenuW(menu, MF_STRING, MENU_SETTINGS, wide("设置中心").as_ptr());
         AppendMenuW(menu, MF_STRING, MENU_REFRESH, wide("刷新索引").as_ptr());
-        let checked = if app_state!(hwnd).light_theme {
-            MF_CHECKED
-        } else {
-            0
-        };
         AppendMenuW(
             menu,
             MF_STRING | checked,
@@ -870,7 +969,9 @@ unsafe fn show_tray_menu(hwnd: HWND) {
 }
 
 unsafe fn toggle_theme(hwnd: HWND) {
-    let light_theme = !app_state!(hwnd).light_theme;
+    let Some(light_theme) = (unsafe { with_app(hwnd, |state| !state.light_theme) }) else {
+        return;
+    };
     let colors = theme(light_theme);
     let background = unsafe { CreateSolidBrush(colors.bg) };
     let panel = unsafe { CreateSolidBrush(colors.bg) };
@@ -886,13 +987,21 @@ unsafe fn toggle_theme(hwnd: HWND) {
         };
         return;
     }
-    let (old_background, old_panel, edit, list) = {
-        let state = app_state!(hwnd);
-        let old = (state.background, state.panel, state.edit, state.list);
-        state.light_theme = light_theme;
-        state.background = background;
-        state.panel = panel;
-        old
+    let swapped = unsafe {
+        with_app_mut(hwnd, |state| {
+            let old = (state.background, state.panel, state.edit, state.list);
+            state.light_theme = light_theme;
+            state.background = background;
+            state.panel = panel;
+            old
+        })
+    };
+    let Some((old_background, old_panel, edit, list)) = swapped else {
+        unsafe {
+            DeleteObject(background as _);
+            DeleteObject(panel as _);
+        }
+        return;
     };
     unsafe {
         DeleteObject(old_background as _);
@@ -940,16 +1049,26 @@ unsafe fn register_available_hotkey(hwnd: HWND, start: HotkeyChoice) -> Option<H
 unsafe fn apply_setting_change(hwnd: HWND, change: SettingChange) {
     match change {
         SettingChange::CycleHotkey => {
-            let (current, was_registered) = {
-                let state = app_state!(hwnd);
-                (state.settings.hotkey, state.hotkey_registered)
+            let Some((current, was_registered)) = (unsafe {
+                with_app(hwnd, |state| {
+                    (state.settings.hotkey, state.hotkey_registered)
+                })
+            }) else {
+                return;
             };
             unsafe { UnregisterHotKey(hwnd, HOTKEY_ID) };
             match unsafe { register_available_hotkey(hwnd, current.next()) } {
                 Some(next) => {
-                    let state = app_state!(hwnd);
-                    state.settings.hotkey = next;
-                    state.hotkey_registered = true;
+                    let updated = unsafe {
+                        with_app_mut(hwnd, |state| {
+                            state.settings.hotkey = next;
+                            state.hotkey_registered = true;
+                        })
+                    };
+                    if updated.is_none() {
+                        unsafe { UnregisterHotKey(hwnd, HOTKEY_ID) };
+                        return;
+                    }
                     let tray = unsafe { tray_data(hwnd) };
                     unsafe { Shell_NotifyIconW(NIM_MODIFY, &tray) };
                     if next == current && was_registered {
@@ -962,7 +1081,11 @@ unsafe fn apply_setting_change(hwnd: HWND, change: SettingChange) {
                     }
                 }
                 None => {
-                    app_state!(hwnd).hotkey_registered = false;
+                    if unsafe { with_app_mut(hwnd, |state| state.hotkey_registered = false) }
+                        .is_none()
+                    {
+                        return;
+                    }
                     let tray = unsafe { tray_data(hwnd) };
                     unsafe { Shell_NotifyIconW(NIM_MODIFY, &tray) };
                     unsafe {
@@ -975,28 +1098,53 @@ unsafe fn apply_setting_change(hwnd: HWND, change: SettingChange) {
             }
         }
         SettingChange::ToggleAutoStart => {
-            let enabled = !app_state!(hwnd).settings.auto_start;
+            let Some(enabled) = (unsafe { with_app(hwnd, |state| !state.settings.auto_start) })
+            else {
+                return;
+            };
             if set_autostart(enabled) {
-                app_state!(hwnd).settings.auto_start = enabled;
+                if unsafe { with_app_mut(hwnd, |state| state.settings.auto_start = enabled) }
+                    .is_none()
+                {
+                    let _ = set_autostart(!enabled);
+                    return;
+                }
             } else {
                 unsafe { show_action_error(hwnd, "无法更改开机自动启动设置。") };
             }
         }
         SettingChange::ToggleTheme => unsafe { toggle_theme(hwnd) },
         SettingChange::CycleResultLimit => {
-            let settings = &mut app_state!(hwnd).settings;
-            settings.result_limit = match settings.result_limit {
-                8 => 12,
-                12 => 20,
-                _ => 8,
-            };
+            if unsafe {
+                with_app_mut(hwnd, |state| {
+                    state.settings.result_limit = match state.settings.result_limit {
+                        8 => 12,
+                        12 => 20,
+                        _ => 8,
+                    };
+                })
+            }
+            .is_none()
+            {
+                return;
+            }
         }
         SettingChange::CycleWebEngine => {
-            let settings = &mut app_state!(hwnd).settings;
-            settings.web_engine = settings.web_engine.next();
+            if unsafe {
+                with_app_mut(hwnd, |state| {
+                    state.settings.web_engine = state.settings.web_engine.next();
+                })
+            }
+            .is_none()
+            {
+                return;
+            }
         }
     }
-    if !save_settings(&app_state!(hwnd).settings) {
+    let Some(settings) = (unsafe { with_app(hwnd, |state| state.settings.clone()) }) else {
+        return;
+    };
+    if !save_settings(&settings) {
         unsafe { show_action_error(hwnd, "设置已应用，但无法保存到磁盘。") };
     }
     unsafe { refresh(hwnd) };
@@ -1220,7 +1368,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             providers.register(FileSearchProvider::new(hwnd as usize, FILE_SEARCH_READY));
             providers.register(ai_service.provider());
             providers.register(ApplicationProvider::empty());
-            let state = Box::new(App {
+            let state = Box::new(RefCell::new(App {
                 edit,
                 list,
                 results: Vec::new(),
@@ -1241,16 +1389,15 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                 indexing: false,
                 index_tx,
                 index_rx,
-            });
+            }));
             unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(state) as isize) };
             let tray = unsafe { tray_data(hwnd) };
             let tray_added = unsafe { Shell_NotifyIconW(NIM_ADD, &tray) } != 0;
             if !tray_added {
                 let access_message = if hotkey_registered {
-                    format!(
-                        "无法创建托盘图标，但 {} 仍可使用。",
-                        app_state!(hwnd).settings.hotkey.label()
-                    )
+                    let hotkey = unsafe { with_app(hwnd, |state| state.settings.hotkey.label()) }
+                        .unwrap_or("已注册快捷键");
+                    format!("无法创建托盘图标，但 {} 仍可使用。", hotkey)
                 } else {
                     "无法创建托盘图标，且全局快捷键不可用；主窗口将直接打开。".to_owned()
                 };
@@ -1285,13 +1432,19 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             0
         }
         INDEX_READY => {
-            let result = {
-                let state = app_state!(hwnd);
-                state.indexing = false;
-                state.index_rx.try_recv()
+            let Some(result) = (unsafe {
+                with_app_mut(hwnd, |state| {
+                    state.indexing = false;
+                    state.index_rx.try_recv()
+                })
+            }) else {
+                return 0;
             };
             match result {
-                Ok(Ok(provider)) => app_state!(hwnd).providers.register(provider),
+                Ok(Ok(provider)) => {
+                    let _ =
+                        unsafe { with_app_mut(hwnd, |state| state.providers.register(provider)) };
+                }
                 Ok(Err(_)) => unsafe {
                     MessageBoxW(
                         hwnd,
@@ -1310,14 +1463,20 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             0
         }
         AI_READY => {
-            let events = app_state!(hwnd).ai_service.drain_events();
+            let Some((events, active_generation, answer_window)) = (unsafe {
+                with_app(hwnd, |state| {
+                    (
+                        state.ai_service.drain_events(),
+                        state.ai_generation,
+                        state.ai_window,
+                    )
+                })
+            }) else {
+                return 0;
+            };
             if events.is_empty() {
                 return 0;
             }
-            let (active_generation, answer_window) = {
-                let state = app_state!(hwnd);
-                (state.ai_generation, state.ai_window)
-            };
             let mut reasoning_delta = String::new();
             let mut answer_delta = String::new();
             let mut terminal = None;
@@ -1356,14 +1515,18 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
         AI_CANCEL => {
             let generation = w as u64;
             let answer_window = l as HWND;
-            let state = app_state!(hwnd);
-            if state.ai_generation == generation {
-                state.ai_service.cancel();
-                if state.ai_window == answer_window && unsafe { IsWindow(answer_window) } == 0 {
-                    state.ai_window = null_mut();
-                    state.ai_generation = 0;
-                }
-            }
+            let answer_window_destroyed = unsafe { IsWindow(answer_window) } == 0;
+            let _ = unsafe {
+                with_app_mut(hwnd, |state| {
+                    if state.ai_generation == generation {
+                        state.ai_service.cancel();
+                        if state.ai_window == answer_window && answer_window_destroyed {
+                            state.ai_window = null_mut();
+                            state.ai_generation = 0;
+                        }
+                    }
+                })
+            };
             cancel_ai_answer(answer_window);
             unsafe { refresh(hwnd) };
             0
@@ -1371,10 +1534,13 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
         AI_WINDOW_CLOSED => {
             let generation = w as u64;
             let answer_window = l as HWND;
-            let state = app_state!(hwnd);
-            if state.ai_generation == generation && state.ai_window == answer_window {
-                state.ai_window = null_mut();
-            }
+            let _ = unsafe {
+                with_app_mut(hwnd, |state| {
+                    if state.ai_generation == generation && state.ai_window == answer_window {
+                        state.ai_window = null_mut();
+                    }
+                })
+            };
             0
         }
         SHOW_EXISTING => {
@@ -1399,43 +1565,44 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             0
         }
         WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
-            if !unsafe { has_app(hwnd) } {
+            let Some((light_theme, panel)) =
+                (unsafe { with_app(hwnd, |state| (state.light_theme, state.panel)) })
+            else {
                 return unsafe { DefWindowProcW(hwnd, msg, w, l) };
-            }
-            let state = app_state!(hwnd);
-            let colors = theme(state.light_theme);
+            };
+            let colors = theme(light_theme);
             unsafe {
                 SetTextColor(w as _, colors.text);
                 SetBkColor(w as _, colors.bg);
             }
-            state.panel as LRESULT
+            panel as LRESULT
         }
         WM_ERASEBKGND => {
-            if !unsafe { has_app(hwnd) } {
+            let Some(background) = (unsafe { with_app(hwnd, |state| state.background) }) else {
                 return unsafe { DefWindowProcW(hwnd, msg, w, l) };
-            }
-            let state = app_state!(hwnd);
+            };
             let mut rect = unsafe { std::mem::zeroed() };
             unsafe {
                 GetClientRect(hwnd, &mut rect);
-                windows_sys::Win32::Graphics::Gdi::FillRect(w as _, &rect, state.background)
+                windows_sys::Win32::Graphics::Gdi::FillRect(w as _, &rect, background)
             };
             1
         }
         WM_PAINT => {
-            if !unsafe { has_app(hwnd) } {
+            let Some((light_theme, dpi)) =
+                (unsafe { with_app(hwnd, |state| (state.light_theme, state.dpi)) })
+            else {
                 return unsafe { DefWindowProcW(hwnd, msg, w, l) };
-            }
-            let state = app_state!(hwnd);
-            let colors = theme(state.light_theme);
+            };
+            let colors = theme(light_theme);
             let mut paint: PAINTSTRUCT = unsafe { std::mem::zeroed() };
             let dc = unsafe { BeginPaint(hwnd, &mut paint) };
             let pen = unsafe { CreatePen(PS_SOLID, 1, colors.divider) };
             let old_pen = unsafe { SelectObject(dc, pen as _) };
-            let y = px(39, state.dpi);
+            let y = px(39, dpi);
             unsafe {
-                MoveToEx(dc, px(8, state.dpi), y, null_mut());
-                LineTo(dc, px(WIDTH - 8, state.dpi), y);
+                MoveToEx(dc, px(8, dpi), y, null_mut());
+                LineTo(dc, px(WIDTH - 8, dpi), y);
                 SelectObject(dc, old_pen);
                 DeleteObject(pen as _);
                 EndPaint(hwnd, &paint)
@@ -1445,29 +1612,41 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
         WM_DRAWITEM => {
             let draw = unsafe { &*(l as *const DRAWITEMSTRUCT) };
             if draw.CtlID == LIST_ID as u32 && draw.itemID != u32::MAX {
-                let state = app_state!(hwnd);
-                let colors = theme(state.light_theme);
-                let display_name = state
-                    .results
-                    .get(draw.itemID as usize)
-                    .map(|result| result.title.as_str());
+                let Some((light_theme, display_name, panel, dpi, font, shortcut_font)) = (unsafe {
+                    with_app(hwnd, |state| {
+                        (
+                            state.light_theme,
+                            state
+                                .results
+                                .get(draw.itemID as usize)
+                                .map(|result| result.title.clone()),
+                            state.panel,
+                            state.dpi,
+                            state.font,
+                            state.shortcut_font,
+                        )
+                    })
+                }) else {
+                    return unsafe { DefWindowProcW(hwnd, msg, w, l) };
+                };
+                let colors = theme(light_theme);
                 if let Some(display_name) = display_name {
                     let selected = draw.itemState & ODS_SELECTED != 0;
-                    unsafe { FillRect(draw.hDC, &draw.rcItem, state.panel) };
+                    unsafe { FillRect(draw.hDC, &draw.rcItem, panel) };
                     if selected {
                         let brush = unsafe { CreateSolidBrush(colors.selected) };
                         let old_brush = unsafe { SelectObject(draw.hDC, brush as _) };
                         let old_pen = unsafe { SelectObject(draw.hDC, GetStockObject(NULL_PEN)) };
-                        let inset = px(3, state.dpi);
+                        let inset = px(3, dpi);
                         unsafe {
                             RoundRect(
                                 draw.hDC,
                                 draw.rcItem.left + inset,
-                                draw.rcItem.top + px(1, state.dpi),
+                                draw.rcItem.top + px(1, dpi),
                                 draw.rcItem.right - inset,
-                                draw.rcItem.bottom - px(1, state.dpi),
-                                px(8, state.dpi),
-                                px(8, state.dpi),
+                                draw.rcItem.bottom - px(1, dpi),
+                                px(8, dpi),
+                                px(8, dpi),
                             )
                         };
                         unsafe {
@@ -1477,19 +1656,19 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                         };
                     }
 
-                    let padding = px(8, state.dpi);
-                    let shortcut_width = px(82, state.dpi);
+                    let padding = px(8, dpi);
+                    let shortcut_width = px(82, dpi);
                     let mut name_rect = draw.rcItem;
                     name_rect.left += padding;
                     name_rect.right -= shortcut_width;
                     let mut shortcut_rect = draw.rcItem;
                     shortcut_rect.left = shortcut_rect.right - shortcut_width;
                     shortcut_rect.right -= padding;
-                    let name = wide(display_name);
+                    let name = wide(&display_name);
                     let shortcut = (draw.itemID < VISIBLE_RESULT_COUNT as u32)
                         .then(|| wide(&format!("Alt+{}", draw.itemID + 1)));
                     unsafe {
-                        SelectObject(draw.hDC, state.font as _);
+                        SelectObject(draw.hDC, font as _);
                         SetBkMode(draw.hDC, TRANSPARENT as i32);
                         SetTextColor(draw.hDC, if selected { colors.text } else { colors.dim });
                         DrawTextW(
@@ -1500,7 +1679,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                             DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
                         );
                         if let Some(shortcut) = shortcut {
-                            SelectObject(draw.hDC, state.shortcut_font as _);
+                            SelectObject(draw.hDC, shortcut_font as _);
                             SetTextColor(draw.hDC, colors.muted);
                             DrawTextW(
                                 draw.hDC,
@@ -1592,19 +1771,26 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             unsafe { UnregisterHotKey(hwnd, HOTKEY_ID) };
             let tray = unsafe { tray_data(hwnd) };
             unsafe { Shell_NotifyIconW(NIM_DELETE, &tray) };
-            let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut App;
+            let ptr = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) } as *mut AppCell;
             if !ptr.is_null() {
+                let can_drop = unsafe { (&*ptr).try_borrow_mut().is_ok() };
                 // Clear the window-owned pointer before dropping App. A synchronous
                 // message during teardown must never observe already-freed state.
                 unsafe { SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0) };
-                let state = unsafe { Box::from_raw(ptr) };
-                state.ai_service.cancel();
-                unsafe {
-                    DeleteObject(state.font as _);
-                    DeleteObject(state.shortcut_font as _);
-                    DeleteObject(state.background as _);
-                    DeleteObject(state.panel as _);
+                if can_drop {
+                    let cell = unsafe { Box::from_raw(ptr) };
+                    let state = RefCell::into_inner(*cell);
+                    state.ai_service.cancel();
+                    unsafe {
+                        DeleteObject(state.font as _);
+                        DeleteObject(state.shortcut_font as _);
+                        DeleteObject(state.background as _);
+                        DeleteObject(state.panel as _);
+                    }
                 }
+                // If destruction was synchronously re-entered while state was borrowed,
+                // leave the allocation alive until process exit rather than invalidating
+                // the active reference. Windows reclaims the process resources immediately.
             }
             unsafe { PostQuitMessage(0) };
             0
@@ -1681,29 +1867,25 @@ fn main() {
                 launch_result(hwnd, position);
                 continue;
             }
+            let launcher_control = with_app(hwnd, |state| {
+                msg.hwnd == state.edit || msg.hwnd == state.list
+            })
+            .unwrap_or(false);
             if msg.message == WM_KEYDOWN
                 && msg.wParam as u16 == VK_F1
-                && (msg.hwnd == hwnd
-                    || msg.hwnd == app_state!(hwnd).edit
-                    || msg.hwnd == app_state!(hwnd).list)
+                && (msg.hwnd == hwnd || launcher_control)
             {
                 show_manual(hwnd);
                 continue;
             }
-            if msg.message == WM_MOUSEWHEEL
-                && (msg.hwnd == hwnd
-                    || msg.hwnd == app_state!(hwnd).edit
-                    || msg.hwnd == app_state!(hwnd).list)
-            {
+            if msg.message == WM_MOUSEWHEEL && (msg.hwnd == hwnd || launcher_control) {
                 let delta = wheel_selection_delta(msg.wParam);
                 if delta != 0 {
                     move_selection(hwnd, delta);
                 }
                 continue;
             }
-            if msg.message == WM_KEYDOWN
-                && (msg.hwnd == app_state!(hwnd).edit || msg.hwnd == app_state!(hwnd).list)
-            {
+            if msg.message == WM_KEYDOWN && launcher_control {
                 if handle_action_shortcut(hwnd, msg.wParam as u16) {
                     continue;
                 }
