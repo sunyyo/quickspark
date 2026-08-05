@@ -28,12 +28,20 @@ pub(crate) enum AiTask {
     Translation,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WebSearchMode {
+    Auto,
+    Required,
+    Disabled,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct AiRequest {
     pub(crate) display_prompt: String,
     pub(crate) request_prompt: String,
     pub(crate) result_label: String,
     pub(crate) task: AiTask,
+    pub(crate) web_search: WebSearchMode,
     pub(crate) cache_key: String,
 }
 
@@ -94,6 +102,7 @@ pub(crate) enum Action {
         reasoning: String,
     },
     ConfigureAiKey,
+    ConfigureTavilyKey,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -135,6 +144,7 @@ impl Action {
             Self::CancelAi => "取消本次请求",
             Self::ShowAiAnswer { .. } => "查看完整回答",
             Self::ConfigureAiKey => "安全设置 API Key",
+            Self::ConfigureTavilyKey => "安全设置 Tavily API Key",
         }
     }
 

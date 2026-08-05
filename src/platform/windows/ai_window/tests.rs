@@ -23,3 +23,15 @@ fn long_answer_display_keeps_full_copy_source_but_bounds_rendering() {
     assert!(display.ends_with(&"答".repeat(super::ANSWER_DISPLAY_CHARS)));
     assert_eq!(answer.chars().count(), super::ANSWER_DISPLAY_CHARS + 2);
 }
+
+#[test]
+fn answer_palette_changes_every_visible_color_in_dark_mode() {
+    let light = super::answer_colors(true);
+    let dark = super::answer_colors(false);
+    assert_ne!(light.window_bg, dark.window_bg);
+    assert_ne!(light.answer_bg, dark.answer_bg);
+    assert_ne!(light.text, dark.text);
+    assert_ne!(light.muted, dark.muted);
+    assert_ne!(light.code, dark.code);
+    assert_ne!(light.link, dark.link);
+}

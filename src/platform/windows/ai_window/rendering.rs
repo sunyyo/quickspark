@@ -13,13 +13,18 @@ pub(super) unsafe fn render_answer(state: &AnswerWindow) {
         SendMessageW(state.answer_edit, WM_SETREDRAW, 0, 0);
         SetWindowTextW(state.answer_edit, wide(&rendered.text).as_ptr());
         if state.rich_edit {
-            SendMessageW(state.answer_edit, EM_SETBKGNDCOLOR, 0, ANSWER_BG as LPARAM);
-            apply_base_format(state.answer_edit, end);
+            SendMessageW(
+                state.answer_edit,
+                EM_SETBKGNDCOLOR,
+                0,
+                state.colors.answer_bg as LPARAM,
+            );
+            apply_base_format(state.answer_edit, end, state.colors.text);
         }
     }
     if state.rich_edit {
         for span in &rendered.spans {
-            unsafe { apply_markdown_span(state.answer_edit, span) };
+            unsafe { apply_markdown_span(state.answer_edit, span, state.colors) };
         }
     }
     unsafe {
@@ -39,8 +44,13 @@ pub(super) unsafe fn render_plain_answer(state: &AnswerWindow) {
         SendMessageW(state.answer_edit, WM_SETREDRAW, 0, 0);
         SetWindowTextW(state.answer_edit, wide(&text).as_ptr());
         if state.rich_edit {
-            SendMessageW(state.answer_edit, EM_SETBKGNDCOLOR, 0, ANSWER_BG as LPARAM);
-            apply_base_format(state.answer_edit, end);
+            SendMessageW(
+                state.answer_edit,
+                EM_SETBKGNDCOLOR,
+                0,
+                state.colors.answer_bg as LPARAM,
+            );
+            apply_base_format(state.answer_edit, end, state.colors.text);
         }
         SendMessageW(state.answer_edit, EM_SETSEL, end, end as LPARAM);
         SendMessageW(state.answer_edit, EM_SCROLLCARET, 0, 0);
@@ -79,13 +89,13 @@ pub(super) unsafe fn render_thinking(state: &AnswerWindow) {
                 state.thinking_edit,
                 EM_SETBKGNDCOLOR,
                 0,
-                ANSWER_BG as LPARAM,
+                state.colors.answer_bg as LPARAM,
             );
             apply_text_format(
                 state.thinking_edit,
                 end,
                 240,
-                MUTED_COLOR,
+                state.colors.muted,
                 "Microsoft YaHei UI",
             );
         }
@@ -113,8 +123,16 @@ pub(super) fn reasoning_tail(value: &str, max_chars: usize) -> (&str, bool) {
     }
 }
 
-unsafe fn apply_base_format(edit: HWND, end: usize) {
-    unsafe { apply_text_format(edit, end, 270, TEXT_COLOR, "Microsoft YaHei UI") };
+unsafe fn apply_base_format(edit: HWND, end: usize, text_color: u32) {
+    unsafe {
+        apply_text_format(
+            edit,
+            end,
+            ANSWER_FONT_TWIPS,
+            text_color,
+            "Microsoft YaHei UI",
+        )
+    };
 }
 
 unsafe fn apply_text_format(edit: HWND, end: usize, height: i32, color: u32, face: &str) {
@@ -136,7 +154,7 @@ unsafe fn apply_text_format(edit: HWND, end: usize, height: i32, color: u32, fac
     }
 }
 
-unsafe fn apply_markdown_span(edit: HWND, span: &MarkdownSpan) {
+unsafe fn apply_markdown_span(edit: HWND, span: &MarkdownSpan, colors: AnswerColors) {
     let mut format = match span.style {
         MarkdownStyle::Heading(level) => {
             let mut format = char_format(CFM_BOLD | CFM_SIZE | CFM_COLOR, CFE_BOLD);
@@ -148,7 +166,7 @@ unsafe fn apply_markdown_span(edit: HWND, span: &MarkdownSpan) {
                 5 => 280,
                 _ => 270,
             };
-            format.text_color = TEXT_COLOR;
+            format.text_color = colors.text;
             format
         }
         MarkdownStyle::Bold => char_format(CFM_BOLD, CFE_BOLD),
@@ -156,18 +174,18 @@ unsafe fn apply_markdown_span(edit: HWND, span: &MarkdownSpan) {
         MarkdownStyle::Strike => char_format(CFM_STRIKEOUT, CFE_STRIKEOUT),
         MarkdownStyle::Code => {
             let mut format = char_format(CFM_FACE | CFM_COLOR, 0);
-            format.text_color = CODE_COLOR;
+            format.text_color = colors.code;
             set_face(&mut format, "Consolas");
             format
         }
         MarkdownStyle::Quote => {
             let mut format = char_format(CFM_ITALIC | CFM_COLOR, CFE_ITALIC);
-            format.text_color = MUTED_COLOR;
+            format.text_color = colors.muted;
             format
         }
         MarkdownStyle::Link => {
             let mut format = char_format(CFM_UNDERLINE | CFM_COLOR, CFE_UNDERLINE);
-            format.text_color = LINK_COLOR;
+            format.text_color = colors.link;
             format
         }
     };

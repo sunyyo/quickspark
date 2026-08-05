@@ -73,8 +73,8 @@ impl Provider for SettingsProvider {
                 }),
             },
             SettingEntry {
-                title: "AI 问答与翻译：配置接口、模型和 API Key".to_owned(),
-                keywords: "ai 人工智能 大模型 翻译 translate tr fy 接口 api key 模型",
+                title: "AI 问答、Tavily 联网搜索与翻译：配置模型和 API Key".to_owned(),
+                keywords: "ai 人工智能 大模型 翻译 tavily 联网 搜索 查证 api key 模型",
                 action: Some(Action::SetQuery {
                     query: "ai settings".to_owned(),
                 }),

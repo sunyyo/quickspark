@@ -8,14 +8,16 @@ use std::{
 
 use windows_sys::Win32::{
     Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
+    Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute},
     Graphics::Gdi::{
         CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, CreateSolidBrush, DEFAULT_CHARSET,
-        DeleteObject, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, FillRect, GetStockObject, HBRUSH, HDC,
-        HFONT, InvalidateRect, OUT_DEFAULT_PRECIS, SetBkColor, SetBkMode, SetTextColor,
-        TRANSPARENT, UpdateWindow,
+        DeleteObject, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, FillRect, HBRUSH, HDC, HFONT,
+        InvalidateRect, OUT_DEFAULT_PRECIS, SetBkColor, SetBkMode, SetTextColor, TRANSPARENT,
+        UpdateWindow,
     },
     System::LibraryLoader::{GetModuleHandleW, LoadLibraryW},
     UI::{
+        Controls::SetWindowTheme,
         HiDpi::GetDpiForWindow,
         Input::KeyboardAndMouse::{EnableWindow, GetKeyState, SetFocus, VK_CONTROL, VK_ESCAPE},
         Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
@@ -41,6 +43,10 @@ mod rendering;
 use rendering::{render_answer, render_plain_answer, render_thinking, rich_edit_available};
 
 const CLASS_NAME: &str = "QuickSparkAiAnswerWindow";
+const DEFAULT_WINDOW_WIDTH: i32 = 860;
+const DEFAULT_WINDOW_HEIGHT: i32 = 620;
+const ANSWER_FONT_PIXELS: i32 = 17;
+const ANSWER_FONT_TWIPS: i32 = 255;
 const COPY_BUTTON_ID: usize = 4101;
 const STOP_BUTTON_ID: usize = 4102;
 const CLOSE_BUTTON_ID: usize = 4103;
@@ -81,6 +87,38 @@ const MUTED_COLOR: u32 = 0x00867B74;
 const CODE_COLOR: u32 = 0x00664D33;
 const LINK_COLOR: u32 = 0x00CC6600;
 
+#[derive(Clone, Copy)]
+struct AnswerColors {
+    window_bg: u32,
+    answer_bg: u32,
+    text: u32,
+    muted: u32,
+    code: u32,
+    link: u32,
+}
+
+fn answer_colors(light: bool) -> AnswerColors {
+    if light {
+        AnswerColors {
+            window_bg: WINDOW_BG,
+            answer_bg: ANSWER_BG,
+            text: TEXT_COLOR,
+            muted: MUTED_COLOR,
+            code: CODE_COLOR,
+            link: LINK_COLOR,
+        }
+    } else {
+        AnswerColors {
+            window_bg: 0x001E1A18,
+            answer_bg: 0x00282320,
+            text: 0x00F2EDE9,
+            muted: 0x00908780,
+            code: 0x00D4B59E,
+            link: 0x00F0B080,
+        }
+    }
+}
+
 #[repr(C)]
 struct CharFormatW {
     cb_size: u32,
@@ -103,6 +141,7 @@ struct AnswerInit {
     closed_message: u32,
     generation: u64,
     streaming: bool,
+    light_theme: bool,
 }
 
 struct AnswerWindow {
@@ -119,9 +158,11 @@ struct AnswerWindow {
     close_button: HWND,
     heading_font: HFONT,
     body_font: HFONT,
+    answer_font: HFONT,
     hint_font: HFONT,
     window_brush: HBRUSH,
     answer_brush: HBRUSH,
+    colors: AnswerColors,
     answer: String,
     reasoning: String,
     reasoning_chars: usize,
@@ -153,7 +194,13 @@ macro_rules! answer_state {
     }};
 }
 
-pub(crate) fn show_ai_answer(owner: HWND, prompt: &str, answer: &str, reasoning: &str) -> bool {
+pub(crate) fn show_ai_answer(
+    owner: HWND,
+    prompt: &str,
+    answer: &str,
+    reasoning: &str,
+    light_theme: bool,
+) -> bool {
     show_answer_window(AnswerInit {
         prompt: normalize_newlines(prompt),
         answer: normalize_newlines(answer),
@@ -163,6 +210,7 @@ pub(crate) fn show_ai_answer(owner: HWND, prompt: &str, answer: &str, reasoning:
         closed_message: 0,
         generation: 0,
         streaming: false,
+        light_theme,
     })
     .is_some()
 }
@@ -173,6 +221,7 @@ pub(crate) fn show_ai_stream(
     cancel_message: u32,
     closed_message: u32,
     generation: u64,
+    light_theme: bool,
 ) -> Option<HWND> {
     show_answer_window(AnswerInit {
         prompt: normalize_newlines(prompt),
@@ -183,7 +232,22 @@ pub(crate) fn show_ai_stream(
         closed_message,
         generation,
         streaming: true,
+        light_theme,
     })
+}
+
+pub(crate) fn update_ai_status(window: HWND, status: &str) -> bool {
+    if window.is_null() || unsafe { IsWindow(window) } == 0 || status.is_empty() {
+        return false;
+    }
+    let Some(state) = answer_state!(window) else {
+        return false;
+    };
+    if !state.streaming {
+        return false;
+    }
+    unsafe { SetWindowTextW(state.hint, wide(status).as_ptr()) };
+    true
 }
 
 fn show_answer_window(mut init: AnswerInit) -> Option<HWND> {
@@ -191,12 +255,12 @@ fn show_answer_window(mut init: AnswerInit) -> Option<HWND> {
         return None;
     }
     let dpi = unsafe { GetDpiForWindow(init.owner) }.max(96);
-    let width = scale(760, dpi);
-    let height = scale(540, dpi);
+    let width = scale(DEFAULT_WINDOW_WIDTH, dpi);
+    let height = scale(DEFAULT_WINDOW_HEIGHT, dpi);
     let mut owner_rect: RECT = unsafe { std::mem::zeroed() };
     unsafe { GetWindowRect(init.owner, &mut owner_rect) };
     let x = owner_rect.left + (owner_rect.right - owner_rect.left - width) / 2;
-    let y = owner_rect.top + scale(16, dpi);
+    let y = owner_rect.top;
     let window = unsafe {
         CreateWindowExW(
             WS_EX_TOOLWINDOW,
@@ -215,6 +279,15 @@ fn show_answer_window(mut init: AnswerInit) -> Option<HWND> {
     };
     if window.is_null() {
         return None;
+    }
+    let dark_mode = i32::from(!init.light_theme);
+    unsafe {
+        DwmSetWindowAttribute(
+            window,
+            DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
+            &dark_mode as *const _ as _,
+            std::mem::size_of_val(&dark_mode) as u32,
+        );
     }
     unsafe {
         ShowWindow(window, SW_SHOW);
@@ -313,8 +386,7 @@ fn register_window_class() -> bool {
         cbWndExtra: std::mem::size_of::<isize>() as i32,
         hInstance: instance,
         hCursor: unsafe { LoadCursorW(null_mut(), IDC_ARROW) },
-        hbrBackground: unsafe { GetStockObject(windows_sys::Win32::Graphics::Gdi::WHITE_BRUSH) }
-            as _,
+        hbrBackground: null_mut(),
         lpszClassName: class_name.as_ptr(),
         ..Default::default()
     };
@@ -425,12 +497,12 @@ unsafe extern "system" fn answer_window_proc(
                         SetTextColor(
                             dc,
                             if control == state.thinking_edit {
-                                MUTED_COLOR
+                                state.colors.muted
                             } else {
-                                TEXT_COLOR
+                                state.colors.text
                             },
                         );
-                        SetBkColor(dc, ANSWER_BG);
+                        SetBkColor(dc, state.colors.answer_bg);
                     }
                     return state.answer_brush as LRESULT;
                 }
@@ -439,9 +511,9 @@ unsafe extern "system" fn answer_window_proc(
                     SetTextColor(
                         dc,
                         if control == state.hint {
-                            MUTED_COLOR
+                            state.colors.muted
                         } else {
-                            TEXT_COLOR
+                            state.colors.text
                         },
                     );
                 }
@@ -451,6 +523,12 @@ unsafe extern "system" fn answer_window_proc(
         }
         WM_CTLCOLORBTN => {
             if let Some(state) = answer_state!(window) {
+                let dc = wparam as HDC;
+                unsafe {
+                    SetBkMode(dc, TRANSPARENT as i32);
+                    SetTextColor(dc, state.colors.text);
+                    SetBkColor(dc, state.colors.window_bg);
+                }
                 return state.window_brush as LRESULT;
             }
             unsafe { DefWindowProcW(window, message, wparam, lparam) }
@@ -490,6 +568,7 @@ unsafe extern "system" fn answer_window_proc(
                     DeleteObject(state.heading_font as _);
                     DeleteObject(state.body_font as _);
                     DeleteObject(state.hint_font as _);
+                    DeleteObject(state.answer_font as _);
                     DeleteObject(state.window_brush as _);
                     DeleteObject(state.answer_brush as _);
                 }
@@ -517,6 +596,7 @@ unsafe fn create_answer_window(window: HWND, lparam: LPARAM) -> LRESULT {
     let heading_font = create_font(dpi, 17, FW_SEMIBOLD);
     let body_font = create_font(dpi, 18, FW_NORMAL);
     let hint_font = create_font(dpi, 14, FW_NORMAL);
+    let answer_font = create_font(dpi, ANSWER_FONT_PIXELS, FW_NORMAL);
     let question_label = unsafe { create_static(window, "问题") };
     let prompt = unsafe { create_static(window, &init.prompt) };
     let answer_label = unsafe { create_static(window, "回答") };
@@ -552,17 +632,34 @@ unsafe fn create_answer_window(window: HWND, lparam: LPARAM) -> LRESULT {
         || heading_font.is_null()
         || body_font.is_null()
         || hint_font.is_null()
+        || answer_font.is_null()
     {
         unsafe {
             delete_font(heading_font);
             delete_font(body_font);
             delete_font(hint_font);
+            delete_font(answer_font);
         }
         return -1;
+    }
+    if !init.light_theme {
+        let dark_control_theme = wide("DarkMode_Explorer");
+        for control in [
+            answer_edit,
+            thinking_edit,
+            thinking_toggle,
+            thinking_copy,
+            copy_button,
+            stop_button,
+            close_button,
+        ] {
+            unsafe { SetWindowTheme(control, dark_control_theme.as_ptr(), null()) };
+        }
     }
     let reasoning = init.reasoning.replace("\r\n", "\n");
     let reasoning_chars = reasoning.chars().count();
     let thinking_visible = init.streaming || !reasoning.is_empty();
+    let colors = answer_colors(init.light_theme);
     let state = Box::new(AnswerWindow {
         question_label,
         prompt,
@@ -578,8 +675,10 @@ unsafe fn create_answer_window(window: HWND, lparam: LPARAM) -> LRESULT {
         heading_font,
         body_font,
         hint_font,
-        window_brush: unsafe { CreateSolidBrush(WINDOW_BG) },
-        answer_brush: unsafe { CreateSolidBrush(ANSWER_BG) },
+        answer_font,
+        window_brush: unsafe { CreateSolidBrush(colors.window_bg) },
+        answer_brush: unsafe { CreateSolidBrush(colors.answer_bg) },
+        colors,
         answer: init.answer.replace("\r\n", "\n"),
         reasoning,
         reasoning_chars,
@@ -603,6 +702,7 @@ unsafe fn create_answer_window(window: HWND, lparam: LPARAM) -> LRESULT {
             DeleteObject(state.heading_font as _);
             DeleteObject(state.body_font as _);
             DeleteObject(state.hint_font as _);
+            DeleteObject(state.answer_font as _);
             if !state.window_brush.is_null() {
                 DeleteObject(state.window_brush as _);
             }
@@ -619,9 +719,13 @@ unsafe fn create_answer_window(window: HWND, lparam: LPARAM) -> LRESULT {
         for control in [state.question_label, state.answer_label] {
             SendMessageW(control, WM_SETFONT, state.heading_font as WPARAM, 1);
         }
-        for control in [state.prompt, state.answer_edit] {
-            SendMessageW(control, WM_SETFONT, state.body_font as WPARAM, 1);
-        }
+        SendMessageW(state.prompt, WM_SETFONT, state.body_font as WPARAM, 1);
+        SendMessageW(
+            state.answer_edit,
+            WM_SETFONT,
+            state.answer_font as WPARAM,
+            1,
+        );
         for control in [
             state.hint,
             state.copy_button,

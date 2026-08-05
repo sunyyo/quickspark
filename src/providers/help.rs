@@ -94,10 +94,10 @@ const TOPICS: &[HelpTopic] = &[
         example: Some("; edit"),
     },
     HelpTopic {
-        title: "AI 问答：ai 问题；ai settings 配置接口",
-        details: "使用 OpenAI 兼容接口；支持 DeepSeek V4 思考模式，思考过程默认折叠，流式阶段轻量显示，完成后渲染 Markdown。",
-        keywords: "ai 人工智能 大模型 问答 api key 接口 模型 openai markdown deepseek 思考",
-        example: Some("ai 介绍一下 Rust"),
+        title: "AI 问答：ai 自动判断联网；--web 强制；--no-web 禁用",
+        details: "模型可使用 Tavily 进行最多三轮查证，来源仅作为内部证据；输入 ai settings 配置模型和两类 API Key。",
+        keywords: "ai 人工智能 大模型 问答 tavily 联网 搜索 查证 来源 api key openai deepseek",
+        example: Some("ai Rust 最新稳定版有哪些变化"),
     },
     HelpTopic {
         title: "AI 翻译：tr 文本；tr --to en / zh / ja / ko 文本",
@@ -268,5 +268,12 @@ mod tests {
             files.results[0].actions.first(),
             Some(Action::SetQuery { query }) if query == "f *.pdf"
         ));
+
+        let ai = TOPICS
+            .iter()
+            .find(|topic| topic.title.starts_with("AI 问答"))
+            .expect("AI help topic should exist");
+        assert!(ai.details.contains("来源仅作为内部证据"));
+        assert!(!ai.details.contains("完成后附来源"));
     }
 }

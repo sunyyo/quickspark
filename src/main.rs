@@ -62,8 +62,9 @@ use windows_sys::Win32::{
 use model::{Action, Query, ResultItem, SettingChange, SystemCommand, Usage};
 use platform::windows::{
     ApiKeyPromptResult, activate_window, append_ai_answer, append_ai_reasoning, cancel_ai_answer,
-    close_ai_answer, copy_text, fail_ai_answer, finish_ai_answer, prompt_ai_api_key, shell_execute,
-    show_ai_answer, show_ai_stream, windows_program,
+    close_ai_answer, copy_text, fail_ai_answer, finish_ai_answer, prompt_ai_api_key,
+    prompt_tavily_api_key, shell_execute, show_ai_answer, show_ai_stream, update_ai_status,
+    windows_program,
 };
 use providers::{
     AiEvent, AiService, ApplicationProvider, CalculatorProvider, CommandProvider,
@@ -433,13 +434,13 @@ unsafe fn execute_action(hwnd: HWND, action: Action) {
         }
         Action::SystemCommand { command } => unsafe { execute_system_command(hwnd, command) },
         Action::AskAi { request } | Action::RegenerateAi { request } => {
-            let Some(previous_window) = (unsafe {
+            let Some((previous_window, light_theme)) = (unsafe {
                 with_app_mut(hwnd, |state| {
                     state.ai_service.cancel();
                     let window = state.ai_window;
                     state.ai_window = null_mut();
                     state.ai_generation = 0;
-                    window
+                    (window, state.light_theme)
                 })
             }) else {
                 return;
@@ -456,6 +457,7 @@ unsafe fn execute_action(hwnd: HWND, action: Action) {
                 AI_CANCEL,
                 AI_WINDOW_CLOSED,
                 generation,
+                light_theme,
             ) else {
                 let _ = unsafe { with_app_mut(hwnd, |state| state.ai_service.cancel()) };
                 unsafe { show_action_error(hwnd, "无法打开 AI 回答窗口。") };
@@ -494,7 +496,8 @@ unsafe fn execute_action(hwnd: HWND, action: Action) {
             answer,
             reasoning,
         } => {
-            if !show_ai_answer(hwnd, &prompt, &answer, &reasoning) {
+            let light_theme = unsafe { with_app(hwnd, |state| state.light_theme) }.unwrap_or(true);
+            if !show_ai_answer(hwnd, &prompt, &answer, &reasoning, light_theme) {
                 unsafe { show_action_error(hwnd, "无法打开 AI 回答窗口。") };
             }
             return;
@@ -514,6 +517,30 @@ unsafe fn execute_action(hwnd: HWND, action: Action) {
                         hwnd,
                         wide("已清除保存的 AI API Key。").as_ptr(),
                         wide("QuickSpark AI").as_ptr(),
+                        MB_OK | MB_ICONINFORMATION,
+                    );
+                },
+                Ok(ApiKeyPromptResult::Cancelled) => {}
+                Err(error) => unsafe { show_action_error(hwnd, &error) },
+            }
+            unsafe { refresh(hwnd) };
+            return;
+        }
+        Action::ConfigureTavilyKey => {
+            match prompt_tavily_api_key(hwnd) {
+                Ok(ApiKeyPromptResult::Saved) => unsafe {
+                    MessageBoxW(
+                        hwnd,
+                        wide("Tavily API Key 已安全保存到 Windows 凭据管理器。").as_ptr(),
+                        wide("QuickSpark Tavily").as_ptr(),
+                        MB_OK | MB_ICONINFORMATION,
+                    );
+                },
+                Ok(ApiKeyPromptResult::Cleared) => unsafe {
+                    MessageBoxW(
+                        hwnd,
+                        wide("已清除保存的 Tavily API Key。").as_ptr(),
+                        wide("QuickSpark Tavily").as_ptr(),
                         MB_OK | MB_ICONINFORMATION,
                     );
                 },
@@ -1480,12 +1507,14 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             let mut reasoning_delta = String::new();
             let mut answer_delta = String::new();
             let mut terminal = None;
+            let mut status = None;
             for event in events {
                 if event.generation() != active_generation {
                     continue;
                 }
                 match event {
                     AiEvent::ReasoningDelta { text, .. } => reasoning_delta.push_str(&text),
+                    AiEvent::Status { text, .. } => status = Some(text),
                     AiEvent::AnswerDelta { text, .. } => answer_delta.push_str(&text),
                     completed @ (AiEvent::Finished { .. } | AiEvent::Failed { .. }) => {
                         terminal = Some(completed);
@@ -1493,6 +1522,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                 }
             }
             if !answer_window.is_null() {
+                if let Some(status) = status {
+                    update_ai_status(answer_window, &status);
+                }
                 if !reasoning_delta.is_empty() {
                     append_ai_reasoning(answer_window, &reasoning_delta);
                 }

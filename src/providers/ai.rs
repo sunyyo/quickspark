@@ -5,22 +5,31 @@ use std::{
         atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
+    time::Duration,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::{
-    model::{Action, AiRequest, AiTask, Query, ResultItem},
-    platform::windows::{ai_api_key_exists, load_ai_api_key},
+    model::{Action, AiRequest, AiTask, Query, ResultItem, WebSearchMode},
+    platform::windows::{ai_api_key_exists, tavily_api_key_exists},
     storage::{AiConfig, ai_config_file, load_ai_config},
 };
 
 use super::{Provider, ProviderContext, ProviderOutput};
 
+mod agent;
+mod tavily;
 mod transport;
 
 const PROVIDER_ID: &str = "ai";
 const ANSWER_LABEL: &str = "AI 回答";
 const TRANSLATION_LABEL: &str = "AI 翻译";
+const MAX_SEARCH_ROUNDS: usize = 3;
+const MAX_SEARCH_QUERIES: usize = 6;
+const MAX_SEARCH_SOURCES: usize = 12;
+const MAX_SEARCH_CONTEXT_CHARS: usize = 20_000;
+const MAX_AGENT_DURATION: Duration = Duration::from_secs(120);
+const AGENT_PROTOCOL_VERSION: &str = "agent-search-v2-no-sources";
 const MAX_IN_FLIGHT_REQUESTS: usize = 2;
 
 #[derive(Clone)]
@@ -36,6 +45,10 @@ pub(crate) struct AiService {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AiEvent {
+    Status {
+        generation: u64,
+        text: String,
+    },
     ReasoningDelta {
         generation: u64,
         text: String,
@@ -145,34 +158,14 @@ impl AiService {
         thread::spawn(move || {
             let _in_flight = InFlightGuard(Arc::clone(&service.in_flight));
             let result = ask_openai_compatible(&request, &config, generation, &service);
-            if service.generation.load(Ordering::Acquire) != generation {
-                return;
-            }
-            match result {
-                Ok(response) => {
-                    *lock_state(&service.state) = AiState::Finished {
-                        request: request.clone(),
-                        result: Ok(response.clone()),
-                    };
-                    service.push_event(AiEvent::Finished {
-                        generation,
-                        prompt: request.display_prompt,
-                        answer: response.answer,
-                        reasoning: response.reasoning,
-                        finish_reason: response.finish_reason,
-                    });
-                }
-                Err(error) => {
-                    *lock_state(&service.state) = AiState::Finished {
-                        request: request.clone(),
-                        result: Err(error.clone()),
-                    };
-                    service.push_event(AiEvent::Failed {
-                        generation,
-                        prompt: request.display_prompt,
-                        error,
-                    });
-                }
+            if let Some(event) = finish_event_if_current(
+                &service.state,
+                &service.generation,
+                generation,
+                request,
+                result,
+            ) {
+                service.push_event(event);
             }
         });
         generation
@@ -199,11 +192,18 @@ impl AiService {
     }
 
     fn push_event(&self, event: AiEvent) {
-        if event.generation() != self.generation.load(Ordering::Acquire) {
-            return;
-        }
         let generation = event.generation();
-        lock_events(&self.events).push_back(event);
+        {
+            let mut events = lock_events(&self.events);
+            // Cancellation and new requests increment generation before they
+            // clear this queue. Re-check while holding the queue lock so a
+            // producer that was already waiting cannot enqueue a stale event
+            // after that clear.
+            if generation != self.generation.load(Ordering::Acquire) {
+                return;
+            }
+            events.push_back(event);
+        }
         if !self.notification_pending.swap(true, Ordering::AcqRel)
             && unsafe { PostMessageW(self.window as _, self.ready_message, generation as usize, 0) }
                 == 0
@@ -224,6 +224,50 @@ impl AiService {
             _ => {}
         }
     }
+
+    fn emit_status(&self, generation: u64, text: impl Into<String>) {
+        self.push_event(AiEvent::Status {
+            generation,
+            text: text.into(),
+        });
+    }
+}
+
+fn finish_event_if_current(
+    state: &Mutex<AiState>,
+    current_generation: &AtomicU64,
+    generation: u64,
+    request: AiRequest,
+    result: Result<AiResponse, String>,
+) -> Option<AiEvent> {
+    let mut state = lock_state(state);
+    let still_loading = matches!(
+        &*state,
+        AiState::Loading {
+            generation: active_generation,
+            ..
+        } if *active_generation == generation
+    );
+    if current_generation.load(Ordering::Acquire) != generation || !still_loading {
+        return None;
+    }
+
+    let event = match &result {
+        Ok(response) => AiEvent::Finished {
+            generation,
+            prompt: request.display_prompt.clone(),
+            answer: response.answer.clone(),
+            reasoning: response.reasoning.clone(),
+            finish_reason: response.finish_reason.clone(),
+        },
+        Err(error) => AiEvent::Failed {
+            generation,
+            prompt: request.display_prompt.clone(),
+            error: error.clone(),
+        },
+    };
+    *state = AiState::Finished { request, result };
+    Some(event)
 }
 
 struct InFlightGuard(Arc<AtomicUsize>);
@@ -237,7 +281,8 @@ impl Drop for InFlightGuard {
 impl AiEvent {
     pub(crate) fn generation(&self) -> u64 {
         match self {
-            Self::ReasoningDelta { generation, .. }
+            Self::Status { generation, .. }
+            | Self::ReasoningDelta { generation, .. }
             | Self::AnswerDelta { generation, .. }
             | Self::Finished { generation, .. }
             | Self::Failed { generation, .. } => *generation,
@@ -271,6 +316,20 @@ impl Provider for AiProvider {
             }
             if matches_ci(terms, &["key", "apikey", "密钥"]) {
                 return message("安全设置 AI API Key", vec![Action::ConfigureAiKey]);
+            }
+            if matches_ci(
+                terms,
+                &["tavily", "tavily key", "web key", "联网密钥", "搜索密钥"],
+            ) {
+                let status = if tavily_api_key_exists() {
+                    "已安全保存"
+                } else {
+                    "未设置"
+                };
+                return message(
+                    &format!("Tavily API Key：{status}"),
+                    vec![Action::ConfigureTavilyKey],
+                );
             }
             return self.request_output(question_request(terms));
         }
@@ -332,9 +391,15 @@ impl AiProvider {
                             preview(&request.display_prompt, 72)
                         )
                     } else {
+                        let mode = match request.web_search {
+                            WebSearchMode::Auto => "（自动判断是否联网）",
+                            WebSearchMode::Required => "（强制联网）",
+                            WebSearchMode::Disabled => "（不联网）",
+                        };
                         format!(
-                            "询问 {}：{}",
+                            "询问 {}{}：{}",
                             config.model,
+                            mode,
                             preview(&request.display_prompt, 72)
                         )
                     };
@@ -348,7 +413,7 @@ impl AiProvider {
         let config = load_ai_config();
         let mut results = vec![ResultItem {
             provider_id: PROVIDER_ID,
-            title: "AI 问答：输入 ai 问题，然后按 Enter 发送".to_owned(),
+            title: "AI 问答：自动判断是否联网，并可使用 Tavily 多轮查证".to_owned(),
             score: 100_000,
             actions: vec![Action::SetQuery {
                 query: "ai ".to_owned(),
@@ -487,6 +552,19 @@ fn ai_settings() -> ProviderOutput {
             },
             ResultItem {
                 provider_id: PROVIDER_ID,
+                title: format!(
+                    "Tavily 搜索 Key：{}（Enter 安全设置）",
+                    if tavily_api_key_exists() {
+                        "已保存到 Windows 凭据管理器"
+                    } else {
+                        "未设置；仅在模型决定联网时需要"
+                    }
+                ),
+                score: 99_996,
+                actions: vec![Action::ConfigureTavilyKey],
+            },
+            ResultItem {
+                provider_id: PROVIDER_ID,
                 title: "配置完成后输入 ai 问题或 tr 文本，按 Enter 发送".to_owned(),
                 score: 99_996,
                 actions: vec![Action::SetQuery {
@@ -562,12 +640,20 @@ fn translation_query(input: &str) -> Option<&str> {
 }
 
 fn question_request(prompt: &str) -> AiRequest {
-    let prompt = prompt.trim().to_owned();
+    let prompt = prompt.trim();
+    let (first, rest) = split_first_term(prompt);
+    let (web_search, prompt) = match (first.to_ascii_lowercase().as_str(), rest.is_empty()) {
+        ("--web", false) => (WebSearchMode::Required, rest),
+        ("--no-web", false) => (WebSearchMode::Disabled, rest),
+        _ => (WebSearchMode::Auto, prompt),
+    };
+    let prompt = prompt.to_owned();
     AiRequest {
         display_prompt: prompt.clone(),
         request_prompt: prompt,
         result_label: ANSWER_LABEL.to_owned(),
         task: AiTask::Question,
+        web_search,
         cache_key: String::new(),
     }
 }
@@ -627,6 +713,7 @@ fn translation_request(terms: &str) -> Option<AiRequest> {
         request_prompt,
         result_label: TRANSLATION_LABEL.to_owned(),
         task: AiTask::Translation,
+        web_search: WebSearchMode::Disabled,
         cache_key: String::new(),
     })
 }
@@ -641,8 +728,9 @@ fn split_first_term(value: &str) -> (&str, &str) {
 
 fn request_cache_key(request: &AiRequest, config: &AiConfig) -> String {
     format!(
-        "{:?}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        "{:?}\u{1f}{:?}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
         request.task,
+        request.web_search,
         request.request_prompt,
         config.api_url.trim(),
         config.model.trim(),
@@ -650,6 +738,7 @@ fn request_cache_key(request: &AiRequest, config: &AiConfig) -> String {
         config.max_tokens,
         config.thinking_mode.key(),
         config.reasoning_effort.key(),
+        AGENT_PROTOCOL_VERSION,
     )
 }
 
@@ -697,18 +786,7 @@ fn ask_openai_compatible(
     generation: u64,
     service: &AiService,
 ) -> Result<AiResponse, String> {
-    if !config.is_ready() {
-        return Err("请先输入 ai settings，配置完整 API 地址和模型名称".to_owned());
-    }
-    let api_key = load_ai_api_key().unwrap_or_default();
-    let body = transport::request_body(config, request);
-    let context = transport::RequestContext {
-        current_generation: Arc::clone(&service.generation),
-        generation,
-    };
-    transport::winhttp_stream_json(config, &api_key, &body, context, |delta| {
-        service.emit_delta(generation, delta)
-    })
+    agent::run(request, config, generation, service)
 }
 
 #[cfg(test)]

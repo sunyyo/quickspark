@@ -66,6 +66,35 @@ pub(super) fn request_body(config: &AiConfig, request: &AiRequest) -> Vec<u8> {
     serde_json::to_vec(&body).unwrap_or_default()
 }
 
+pub(super) fn agent_request_body(config: &AiConfig, system: &str, prompt: &str) -> Vec<u8> {
+    let messages = vec![
+        json!({ "role": "system", "content": system }),
+        json!({ "role": "user", "content": prompt }),
+    ];
+    let mut body = json!({
+        "model": config.model.trim(),
+        "messages": messages,
+        "stream": false,
+        "max_tokens": config.max_tokens.clamp(512, 4096),
+    });
+    if let Some(body) = body.as_object_mut() {
+        match config.thinking_mode {
+            ThinkingMode::Auto => {}
+            ThinkingMode::Enabled => {
+                body.insert("thinking".to_owned(), json!({ "type": "enabled" }));
+                body.insert(
+                    "reasoning_effort".to_owned(),
+                    json!(config.reasoning_effort.key()),
+                );
+            }
+            ThinkingMode::Disabled => {
+                body.insert("thinking".to_owned(), json!({ "type": "disabled" }));
+            }
+        }
+    }
+    serde_json::to_vec(&body).unwrap_or_default()
+}
+
 pub(super) fn extract_response(bytes: &[u8]) -> Result<AiResponse, String> {
     let value: Value = serde_json::from_slice(bytes)
         .map_err(|error| format!("接口返回的不是有效 JSON：{error}"))?;
@@ -281,6 +310,121 @@ where
     }
 }
 
+pub(super) fn winhttp_json(
+    url: &str,
+    api_key: &str,
+    body: &[u8],
+    timeout_seconds: u32,
+    context: RequestContext,
+    service_name: &str,
+) -> Result<Vec<u8>, String> {
+    let parsed = ParsedUrl::parse(url)?;
+    context.ensure_current()?;
+    let user_agent = wide(concat!("QuickSpark/", env!("CARGO_PKG_VERSION")));
+    let session = InternetHandle::new(unsafe {
+        WinHttpOpen(
+            user_agent.as_ptr(),
+            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+            null(),
+            null(),
+            0,
+        )
+    })
+    .ok_or_else(|| last_error("无法初始化 WinHTTP"))?;
+    let timeout = i32::try_from(timeout_seconds.saturating_mul(1_000)).unwrap_or(i32::MAX);
+    if unsafe { WinHttpSetTimeouts(session.0, timeout, timeout, timeout, timeout) } == 0 {
+        return Err(last_error(&format!("无法设置 {service_name} 请求超时")));
+    }
+    let host = wide(&parsed.host);
+    let connection =
+        InternetHandle::new(unsafe { WinHttpConnect(session.0, host.as_ptr(), parsed.port, 0) })
+            .ok_or_else(|| last_error(&format!("无法连接 {service_name} 接口主机")))?;
+    let verb = wide("POST");
+    let object = wide(&parsed.object);
+    let flags = if parsed.secure {
+        WINHTTP_FLAG_SECURE
+    } else {
+        0
+    };
+    let request = unsafe {
+        WinHttpOpenRequest(
+            connection.0,
+            verb.as_ptr(),
+            object.as_ptr(),
+            null(),
+            null(),
+            null(),
+            flags,
+        )
+    };
+    let request = InternetHandle::new(request)
+        .ok_or_else(|| last_error(&format!("无法创建 {service_name} HTTP 请求")))?;
+    context.ensure_current()?;
+    let disabled_features = WINHTTP_DISABLE_REDIRECTS;
+    if unsafe {
+        WinHttpSetOption(
+            request.0,
+            WINHTTP_OPTION_DISABLE_FEATURE,
+            (&disabled_features as *const u32).cast(),
+            std::mem::size_of_val(&disabled_features) as u32,
+        )
+    } == 0
+    {
+        return Err(last_error(&format!(
+            "无法禁用 {service_name} 请求自动重定向"
+        )));
+    }
+    let mut headers = "Content-Type: application/json\r\nAccept: application/json\r\n".to_owned();
+    if !api_key.trim().is_empty() {
+        headers.push_str("Authorization: Bearer ");
+        headers.push_str(api_key.trim());
+        headers.push_str("\r\n");
+    }
+    let headers = wide(&headers);
+    if unsafe {
+        WinHttpSendRequest(
+            request.0,
+            headers.as_ptr(),
+            u32::MAX,
+            body.as_ptr() as _,
+            body.len() as u32,
+            body.len() as u32,
+            0,
+        )
+    } == 0
+    {
+        return Err(last_error(&format!("发送 {service_name} 请求失败")));
+    }
+    context.ensure_current()?;
+    if unsafe { WinHttpReceiveResponse(request.0, null_mut()) } == 0 {
+        return Err(last_error(&format!("接收 {service_name} 响应失败")));
+    }
+    context.ensure_current()?;
+    let status = response_status(request.0)?;
+    let mut response = Vec::new();
+    read_response_chunks(request.0, |chunk| {
+        context.ensure_current()?;
+        let new_len = response
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| format!("{service_name} 响应过大"))?;
+        if new_len > MAX_RESPONSE_BYTES {
+            return Err(format!("{service_name} 响应超过 4 MB 安全上限"));
+        }
+        response.extend_from_slice(chunk);
+        Ok(())
+    })?;
+    if !(200..300).contains(&status) {
+        let details = api_error_message(&response);
+        return Err(if details.is_empty() {
+            format!("{service_name} 接口返回 HTTP {status}")
+        } else {
+            format!("{service_name} 接口返回 HTTP {status}：{details}")
+        });
+    }
+    Ok(response)
+}
+
 fn response_status(request: *mut c_void) -> Result<u32, String> {
     let mut status = 0u32;
     let mut size = std::mem::size_of::<u32>() as u32;
@@ -374,7 +518,7 @@ impl RequestContext {
         }
     }
 
-    fn ensure_current(&self) -> Result<(), String> {
+    pub(super) fn ensure_current(&self) -> Result<(), String> {
         (self.current_generation.load(Ordering::Acquire) == self.generation)
             .then_some(())
             .ok_or_else(|| "AI 请求已取消".to_owned())

@@ -9,7 +9,8 @@ use windows_sys::Win32::{
     },
 };
 
-const TARGET: &str = "QuickSpark/AI/APIKey";
+const AI_TARGET: &str = "QuickSpark/AI/APIKey";
+const TAVILY_TARGET: &str = "QuickSpark/Tavily/APIKey";
 
 pub(crate) enum ApiKeyPromptResult {
     Saved,
@@ -22,7 +23,19 @@ pub(crate) fn ai_api_key_exists() -> bool {
 }
 
 pub(crate) fn load_ai_api_key() -> Option<String> {
-    let target = wide(TARGET);
+    load_api_key(AI_TARGET)
+}
+
+pub(crate) fn tavily_api_key_exists() -> bool {
+    load_tavily_api_key().is_some()
+}
+
+pub(crate) fn load_tavily_api_key() -> Option<String> {
+    load_api_key(TAVILY_TARGET)
+}
+
+fn load_api_key(target_name: &str) -> Option<String> {
+    let target = wide(target_name);
     let mut credential = std::ptr::null_mut();
     if unsafe { CredReadW(target.as_ptr(), CRED_TYPE_GENERIC, 0, &mut credential) } == 0
         || credential.is_null()
@@ -46,15 +59,39 @@ pub(crate) fn load_ai_api_key() -> Option<String> {
 }
 
 pub(crate) fn prompt_ai_api_key(parent: HWND) -> Result<ApiKeyPromptResult, String> {
-    let message = wide(
+    prompt_api_key(
+        parent,
+        AI_TARGET,
+        "QuickSpark AI",
+        "QuickSpark AI API Key",
         "请输入 OpenAI 兼容接口的 API Key。它会保存到 Windows 凭据管理器；留空并确认可清除已有 Key。",
-    );
-    let caption = wide("QuickSpark AI API Key");
-    let target = wide(TARGET);
+    )
+}
+
+pub(crate) fn prompt_tavily_api_key(parent: HWND) -> Result<ApiKeyPromptResult, String> {
+    prompt_api_key(
+        parent,
+        TAVILY_TARGET,
+        "QuickSpark Tavily",
+        "QuickSpark Tavily API Key",
+        "请输入 Tavily Search API Key。它会单独保存到 Windows 凭据管理器；留空并确认可清除已有 Key。",
+    )
+}
+
+fn prompt_api_key(
+    parent: HWND,
+    target_name: &str,
+    username_label: &str,
+    caption_text: &str,
+    message_text: &str,
+) -> Result<ApiKeyPromptResult, String> {
+    let message = wide(message_text);
+    let caption = wide(caption_text);
+    let target = wide(target_name);
     let mut username = vec![0u16; 64];
     copy_wide_to_buffer("API Key", &mut username);
     let mut password = vec![0u16; 2_048];
-    if let Some(existing) = load_ai_api_key() {
+    if let Some(existing) = load_api_key(target_name) {
         copy_wide_to_buffer(&existing, &mut password);
     }
     let info = CREDUI_INFOW {
@@ -101,7 +138,7 @@ pub(crate) fn prompt_ai_api_key(parent: HWND) -> Result<ApiKeyPromptResult, Stri
     let api_key = api_key.trim();
     if api_key.is_empty() {
         let deleted = unsafe { CredDeleteW(target.as_ptr(), CRED_TYPE_GENERIC, 0) };
-        if deleted == 0 && ai_api_key_exists() {
+        if deleted == 0 && load_api_key(target_name).is_some() {
             return Err(last_error("无法清除 API Key"));
         }
         return Ok(ApiKeyPromptResult::Cleared);
@@ -109,13 +146,13 @@ pub(crate) fn prompt_ai_api_key(parent: HWND) -> Result<ApiKeyPromptResult, Stri
     if api_key.contains(['\r', '\n']) {
         return Err("API Key 不能包含换行符".to_owned());
     }
-    save_api_key(api_key)?;
+    save_api_key(target_name, username_label, api_key)?;
     Ok(ApiKeyPromptResult::Saved)
 }
 
-fn save_api_key(api_key: &str) -> Result<(), String> {
-    let mut target = wide(TARGET);
-    let mut username = wide("QuickSpark AI");
+fn save_api_key(target_name: &str, username_label: &str, api_key: &str) -> Result<(), String> {
+    let mut target = wide(target_name);
+    let mut username = wide(username_label);
     let mut bytes = api_key.as_bytes().to_vec();
     let credential = CREDENTIALW {
         Type: CRED_TYPE_GENERIC,
