@@ -66,6 +66,7 @@ use platform::windows::{
     prompt_tavily_api_key, shell_execute, show_ai_answer, show_ai_stream, update_ai_status,
     windows_program,
 };
+use providers::UrlProvider;
 use providers::{
     AiEvent, AiService, ApplicationProvider, CalculatorProvider, CommandProvider,
     ConverterProvider, FileSearchProvider, HelpProvider, IndexError, ProviderContext,
@@ -1388,6 +1389,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             providers.register(SettingsProvider::new());
             providers.register(CommandProvider::new());
             providers.register(SystemProvider::new());
+            providers.register(UrlProvider);
             providers.register(WebSearchProvider::new());
             providers.register(CalculatorProvider::new());
             providers.register(ConverterProvider::new());

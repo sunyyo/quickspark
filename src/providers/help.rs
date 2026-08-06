@@ -94,6 +94,12 @@ const TOPICS: &[HelpTopic] = &[
         example: Some("; edit"),
     },
     HelpTopic {
+        title: "直接打开网址：http://、https:// 或 www.",
+        details: "粘贴完整 HTTP/HTTPS 网址，或输入 www. 开头的域名，按 Enter 使用默认浏览器打开。",
+        keywords: "网址 网页 浏览器 url http https www 打开",
+        example: Some("www.rust-lang.org"),
+    },
+    HelpTopic {
         title: "AI 问答：ai 自动判断联网；--web 强制；--no-web 禁用",
         details: "模型可使用 Tavily 进行最多三轮查证，来源仅作为内部证据；输入 ai settings 配置模型和两类 API Key。",
         keywords: "ai 人工智能 大模型 问答 tavily 联网 搜索 查证 来源 api key openai deepseek",

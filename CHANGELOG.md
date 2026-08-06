@@ -6,6 +6,10 @@ QuickSpark 的重要变更记录在此文件中。
 
 ## [Unreleased]
 
+### Added
+
+- 支持直接粘贴 HTTP/HTTPS 网址或输入 www. 简写，并使用系统默认浏览器打开。
+
 ## [0.1.3] - 2026-07-24
 
 ### Fixed

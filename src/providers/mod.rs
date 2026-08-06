@@ -7,6 +7,7 @@ pub(crate) mod file_search;
 pub(crate) mod help;
 pub(crate) mod settings;
 pub(crate) mod system;
+pub(crate) mod url;
 pub(crate) mod web_search;
 pub(crate) mod window_switcher;
 
@@ -26,6 +27,7 @@ pub(crate) use file_search::FileSearchProvider;
 pub(crate) use help::HelpProvider;
 pub(crate) use settings::SettingsProvider;
 pub(crate) use system::SystemProvider;
+pub(crate) use url::UrlProvider;
 pub(crate) use web_search::WebSearchProvider;
 pub(crate) use window_switcher::WindowSwitcherProvider;
 
