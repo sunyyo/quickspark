@@ -1,6 +1,6 @@
 # QuickSpark
 
-QuickSpark 是一个轻量、原生的 Windows 快捷启动器。
+QuickSpark 是一个使用 Rust 开发的轻量、原生 Windows 快捷启动器。它以单文件形式运行，空闲常驻内存通常只有约 10 MB，实际占用会随 Windows 版本和使用状态略有变化。
 
 按下 `Alt + Space`，输入应用名、文件、网址、命令或问题，然后按 `Enter`。它不需要账号，不做遥测，也不会为了搜索应用而在后台扫描整块硬盘。
 
