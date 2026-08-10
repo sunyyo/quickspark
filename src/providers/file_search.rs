@@ -585,7 +585,7 @@ mod tests {
 
     #[test]
     fn parses_unicode_full_paths_from_everything_reply() {
-        let paths = [r"C:\Users\Alice\报告.pdf", r"E:\123\quick-launcher"];
+        let paths = [r"C:\Users\Alice\报告.pdf", r"D:\Projects\QuickSpark"];
         let reply = reply_with_paths(&paths);
         assert_eq!(
             parse_everything_reply(&reply),
@@ -595,7 +595,7 @@ mod tests {
                     path: PathBuf::from(paths[0]),
                 },
                 FileEntry {
-                    name: "quick-launcher".to_owned(),
+                    name: "QuickSpark".to_owned(),
                     path: PathBuf::from(paths[1]),
                 },
             ])

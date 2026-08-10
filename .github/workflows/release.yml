@@ -1,0 +1,81 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: Build and publish Windows release
+    runs-on: windows-latest
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Validate tag and package version
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = ($metadata.packages | Where-Object name -eq "quickspark").version
+          $expectedTag = "v$version"
+          if ($env:GITHUB_REF_NAME -ne $expectedTag) {
+            throw "Tag $env:GITHUB_REF_NAME does not match Cargo.toml version $expectedTag"
+          }
+
+      - name: Remove build-machine paths
+        shell: pwsh
+        run: |
+          $flags = "--remap-path-prefix=$env:GITHUB_WORKSPACE=project --remap-path-prefix=$env:USERPROFILE=C:\Users\user"
+          "RUSTFLAGS=$flags" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Check formatting
+        run: cargo fmt --check
+
+      - name: Run Clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run release tests
+        run: cargo test --release
+
+      - name: Build release executable
+        run: cargo build --release
+
+      - name: Create SHA-256 checksum
+        shell: pwsh
+        run: |
+          $exe = "target/release/quickspark.exe"
+          $checksum = (Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$checksum  quickspark.exe" | Set-Content -LiteralPath "$exe.sha256" -Encoding ascii
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $assets = @(
+            "target/release/quickspark.exe#QuickSpark for Windows",
+            "target/release/quickspark.exe.sha256#SHA-256 checksum"
+          )
+
+          $ErrorActionPreference = "Continue"
+          gh release view $tag *> $null
+          $releaseExists = $LASTEXITCODE -eq 0
+          $ErrorActionPreference = "Stop"
+
+          if ($releaseExists) {
+            gh release upload $tag $assets --clobber
+          } else {
+            gh release create $tag $assets --verify-tag --title "QuickSpark $tag" --generate-notes
+          }

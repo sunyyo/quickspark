@@ -128,6 +128,9 @@ pub(crate) struct AiConfig {
     pub(crate) reasoning_effort: ReasoningEffort,
 }
 
+const DEFAULT_SYSTEM_PROMPT: &str = "你是一名严谨、实用的中文 AI 助手。直接回答用户的核心问题，默认使用简体中文。简单问题简洁作答；复杂问题使用清晰的结构、步骤和必要示例。不得编造事实、来源或执行结果；不确定时明确说明，并给出验证方法。提供建议时应具体、可执行，并指出重要前提与风险。避免重复问题、空泛开场和不必要的总结。严格遵循用户指定的格式、语言和篇幅。";
+const LEGACY_SYSTEM_PROMPT: &str = "你是一个简洁、可靠的中文助手。";
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ThinkingMode {
     #[default]
@@ -184,7 +187,7 @@ impl Default for AiConfig {
         Self {
             api_url: String::new(),
             model: String::new(),
-            system_prompt: "你是一个简洁、可靠的中文助手。".to_owned(),
+            system_prompt: DEFAULT_SYSTEM_PROMPT.to_owned(),
             max_tokens: 8192,
             timeout_seconds: 60,
             thinking_mode: ThinkingMode::Auto,
@@ -574,7 +577,7 @@ pub(crate) fn ai_config_file() -> Option<PathBuf> {
 # API Key 请在 QuickSpark 中输入 ai key 安全设置，不要写在本文件。\n\
 api_url=\n\
 model=\n\
-system_prompt=你是一个简洁、可靠的中文助手。\n\
+system_prompt=你是一名严谨、实用的中文 AI 助手。直接回答用户的核心问题，默认使用简体中文。简单问题简洁作答；复杂问题使用清晰的结构、步骤和必要示例。不得编造事实、来源或执行结果；不确定时明确说明，并给出验证方法。提供建议时应具体、可执行，并指出重要前提与风险。避免重复问题、空泛开场和不必要的总结。严格遵循用户指定的格式、语言和篇幅。\n\
 max_tokens=8192\n\
 timeout_seconds=60\n\
 # DeepSeek V4 思考模式：auto / enabled / disabled；强度：high / max\n\
@@ -592,6 +595,12 @@ fn ensure_ai_thinking_settings(path: &Path) {
     let Ok(mut text) = fs::read_to_string(path) else {
         return;
     };
+    let legacy_prompt = format!("system_prompt={LEGACY_SYSTEM_PROMPT}");
+    let current_prompt = format!("system_prompt={DEFAULT_SYSTEM_PROMPT}");
+    let upgraded_prompt = text.contains(&legacy_prompt);
+    if upgraded_prompt {
+        text = text.replace(&legacy_prompt, &current_prompt);
+    }
     let has_key = |expected: &str| {
         text.lines().any(|line| {
             let line = line.trim();
@@ -603,7 +612,7 @@ fn ensure_ai_thinking_settings(path: &Path) {
     };
     let has_thinking_mode = has_key("thinking_mode");
     let has_reasoning_effort = has_key("reasoning_effort");
-    if has_thinking_mode && has_reasoning_effort {
+    if has_thinking_mode && has_reasoning_effort && !upgraded_prompt {
         return;
     }
     if !text.ends_with('\n') {
