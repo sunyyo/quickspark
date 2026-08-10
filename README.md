@@ -155,20 +155,6 @@ cargo clippy --all-targets -- -D warnings
 cargo test --release
 ```
 
-## 发布新版本
-
-项目已配置 GitHub Actions。版本标签与 `Cargo.toml` 中的版本一致时，会自动在 Windows runner 上测试和构建，并把 EXE 与 SHA-256 校验文件上传到 GitHub Release。
-
-当前版本为 `0.1.3`，发布命令示例：
-
-```powershell
-git tag v0.1.3
-git push origin main
-git push origin v0.1.3
-```
-
-工作流见 [.github/workflows/release.yml](.github/workflows/release.yml)。
-
 ## 项目定位
 
 QuickSpark 想做的是一个启动快、行为清楚、放在后台不打扰你的 Windows 小工具，而不是另一个带账号、插件市场和聊天记录的完整平台。
