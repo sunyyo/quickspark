@@ -437,14 +437,30 @@ fn refuses_redirects_instead_of_forwarding_bearer_credentials() {
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
         let mut request = Vec::new();
-        loop {
+        let header_end = loop {
             let mut chunk = [0u8; 4 * 1024];
             let read = stream.read(&mut chunk).unwrap();
             assert!(read > 0);
             request.extend_from_slice(&chunk[..read]);
-            if request.windows(4).any(|part| part == b"\r\n\r\n") {
-                break;
+            if let Some(position) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+                break position + 4;
             }
+        };
+        let header_text = String::from_utf8_lossy(&request[..header_end]);
+        let content_length = header_text
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())
+                    .flatten()
+            })
+            .unwrap();
+        while request.len() < header_end + content_length {
+            let mut chunk = [0u8; 4 * 1024];
+            let read = stream.read(&mut chunk).unwrap();
+            assert!(read > 0);
+            request.extend_from_slice(&chunk[..read]);
         }
         assert!(
             String::from_utf8_lossy(&request)
