@@ -10,7 +10,6 @@ mod storage;
 use std::{
     cell::RefCell,
     collections::{HashMap, HashSet},
-    os::windows::ffi::OsStrExt,
     ptr::{NonNull, null, null_mut},
     sync::{
         OnceLock,
@@ -63,7 +62,7 @@ use model::{Action, Query, ResultItem, SettingChange, SystemCommand, Usage};
 use platform::windows::{
     ApiKeyPromptResult, activate_window, append_ai_answer, append_ai_reasoning, cancel_ai_answer,
     close_ai_answer, copy_text, fail_ai_answer, finish_ai_answer, prompt_ai_api_key,
-    prompt_tavily_api_key, shell_execute, show_ai_answer, show_ai_stream, update_ai_status,
+    prompt_tavily_api_key, shell_execute, show_ai_answer, show_ai_stream, update_ai_status, wide,
     windows_program,
 };
 use providers::UrlProvider;
@@ -168,13 +167,6 @@ fn now_seconds() -> u64 {
 
 fn px(value: i32, dpi: u32) -> i32 {
     value * dpi as i32 / 96
-}
-
-fn wide(s: &str) -> Vec<u16> {
-    std::ffi::OsStr::new(s)
-        .encode_wide()
-        .chain(Some(0))
-        .collect()
 }
 
 type AppCell = RefCell<App>;
@@ -1385,15 +1377,15 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             let (index_tx, index_rx) = mpsc::channel();
             let mut providers = ProviderRegistry::new();
             let ai_service = AiService::new(hwnd as usize, AI_READY);
-            providers.register(HelpProvider::new());
-            providers.register(SettingsProvider::new());
-            providers.register(CommandProvider::new());
-            providers.register(SystemProvider::new());
+            providers.register(HelpProvider);
+            providers.register(SettingsProvider);
+            providers.register(CommandProvider);
+            providers.register(SystemProvider);
             providers.register(UrlProvider);
-            providers.register(WebSearchProvider::new());
-            providers.register(CalculatorProvider::new());
-            providers.register(ConverterProvider::new());
-            providers.register(WindowSwitcherProvider::new());
+            providers.register(WebSearchProvider);
+            providers.register(CalculatorProvider);
+            providers.register(ConverterProvider);
+            providers.register(WindowSwitcherProvider);
             providers.register(FileSearchProvider::new(hwnd as usize, FILE_SEARCH_READY));
             providers.register(ai_service.provider());
             providers.register(ApplicationProvider::empty());

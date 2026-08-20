@@ -6,12 +6,6 @@ const PROVIDER_ID: &str = "system";
 
 pub(crate) struct SystemProvider;
 
-impl SystemProvider {
-    pub(crate) fn new() -> Self {
-        Self
-    }
-}
-
 impl Provider for SystemProvider {
     fn id(&self) -> &'static str {
         PROVIDER_ID

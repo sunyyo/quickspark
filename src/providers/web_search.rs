@@ -9,12 +9,6 @@ const PROVIDER_ID: &str = "web-search";
 
 pub(crate) struct WebSearchProvider;
 
-impl WebSearchProvider {
-    pub(crate) fn new() -> Self {
-        Self
-    }
-}
-
 impl Provider for WebSearchProvider {
     fn id(&self) -> &'static str {
         PROVIDER_ID

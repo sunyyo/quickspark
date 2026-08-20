@@ -119,7 +119,7 @@ fn web_search_prefixes_build_encoded_urls() {
 fn provider_registry_returns_exclusive_web_results() {
     let mut registry = ProviderRegistry::new();
     registry.register(ApplicationProvider::empty());
-    registry.register(WebSearchProvider::new());
+    registry.register(WebSearchProvider);
     let usage = HashMap::new();
     let settings = Settings::default();
     let pinned = HashSet::new();
@@ -147,8 +147,8 @@ fn provider_registry_returns_exclusive_web_results() {
 fn provider_registry_returns_copyable_calculator_result() {
     let mut registry = ProviderRegistry::new();
     registry.register(ApplicationProvider::empty());
-    registry.register(WebSearchProvider::new());
-    registry.register(CalculatorProvider::new());
+    registry.register(WebSearchProvider);
+    registry.register(CalculatorProvider);
     let usage = HashMap::new();
     let settings = Settings::default();
     let pinned = HashSet::new();

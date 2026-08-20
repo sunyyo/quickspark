@@ -8,12 +8,6 @@ const MAX_PARSE_DEPTH: usize = 32;
 
 pub(crate) struct CalculatorProvider;
 
-impl CalculatorProvider {
-    pub(crate) fn new() -> Self {
-        Self
-    }
-}
-
 impl Provider for CalculatorProvider {
     fn id(&self) -> &'static str {
         PROVIDER_ID

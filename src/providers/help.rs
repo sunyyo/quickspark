@@ -6,12 +6,6 @@ const PROVIDER_ID: &str = "help";
 
 pub(crate) struct HelpProvider;
 
-impl HelpProvider {
-    pub(crate) fn new() -> Self {
-        Self
-    }
-}
-
 impl Provider for HelpProvider {
     fn id(&self) -> &'static str {
         PROVIDER_ID
@@ -247,7 +241,7 @@ mod tests {
 
     #[test]
     fn lists_and_filters_manual_topics() {
-        let provider = HelpProvider::new();
+        let provider = HelpProvider;
         let usage = HashMap::new();
         let pinned = HashSet::new();
         let settings = Settings::default();

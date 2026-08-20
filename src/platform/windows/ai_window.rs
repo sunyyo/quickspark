@@ -1,6 +1,5 @@
 use std::{
     borrow::Cow,
-    os::windows::ffi::OsStrExt,
     ptr::{null, null_mut},
     sync::OnceLock,
     time::Instant,
@@ -37,6 +36,7 @@ use windows_sys::Win32::{
 
 use super::clipboard::copy_text;
 use super::markdown::{MarkdownSpan, MarkdownStyle, render_markdown};
+use super::wide;
 
 mod rendering;
 
@@ -1263,13 +1263,6 @@ fn normalize_newlines(value: &str) -> String {
 
 fn scale(value: i32, dpi: u32) -> i32 {
     value * dpi as i32 / 96
-}
-
-fn wide(value: &str) -> Vec<u16> {
-    std::ffi::OsStr::new(value)
-        .encode_wide()
-        .chain(Some(0))
-        .collect()
 }
 
 #[cfg(test)]

@@ -1,7 +1,6 @@
 use std::{
     ffi::c_void,
     net::IpAddr,
-    os::windows::ffi::OsStrExt,
     ptr::{null, null_mut},
     sync::{
         Arc,
@@ -21,6 +20,7 @@ use windows_sys::Win32::Networking::WinHttp::{
 
 use crate::{
     model::{AiRequest, AiTask},
+    platform::windows::wide,
     storage::{AiConfig, ThinkingMode},
 };
 
@@ -730,11 +730,4 @@ impl Drop for InternetHandle {
 
 fn last_error(context: &str) -> String {
     format!("{context}：{}", std::io::Error::last_os_error())
-}
-
-fn wide(value: &str) -> Vec<u16> {
-    std::ffi::OsStr::new(value)
-        .encode_wide()
-        .chain(Some(0))
-        .collect()
 }

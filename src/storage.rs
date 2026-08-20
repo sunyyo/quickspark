@@ -2,7 +2,6 @@ use std::{
     collections::{HashMap, HashSet},
     env, fs,
     net::IpAddr,
-    os::windows::ffi::OsStrExt,
     path::{Path, PathBuf},
 };
 
@@ -15,7 +14,7 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::model::Usage;
+use crate::{model::Usage, platform::windows::wide};
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "QuickSpark";
@@ -698,13 +697,6 @@ pub(crate) fn save_pinned(pinned: &HashSet<String>) -> bool {
         .map(|key| format!("{key}\n"))
         .collect::<String>();
     write_atomic(&path, &text)
-}
-
-fn wide(value: &str) -> Vec<u16> {
-    std::ffi::OsStr::new(value)
-        .encode_wide()
-        .chain(Some(0))
-        .collect()
 }
 
 #[cfg(test)]

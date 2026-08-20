@@ -22,7 +22,6 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Shutdown",
     "Win32_System_SystemInformation",
     "Win32_Storage_FileSystem",
-    "Win32_Security",
     "Win32_Security_Credentials",
     "Win32_Networking_WinHttp",
     "Win32_UI_Controls",

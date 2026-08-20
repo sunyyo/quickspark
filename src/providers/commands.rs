@@ -11,12 +11,6 @@ const PROVIDER_ID: &str = "commands";
 
 pub(crate) struct CommandProvider;
 
-impl CommandProvider {
-    pub(crate) fn new() -> Self {
-        Self
-    }
-}
-
 impl Provider for CommandProvider {
     fn id(&self) -> &'static str {
         PROVIDER_ID

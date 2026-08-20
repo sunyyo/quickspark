@@ -18,3 +18,7 @@ pub(crate) use clipboard::copy_text;
 pub(crate) use date::local_date;
 pub(crate) use shell::{shell_execute, windows_program};
 pub(crate) use window::activate_window;
+
+pub(crate) fn wide(value: &str) -> Vec<u16> {
+    value.encode_utf16().chain(Some(0)).collect()
+}

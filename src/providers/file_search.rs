@@ -22,7 +22,10 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::model::{Action, Query, ResultItem};
+use crate::{
+    model::{Action, Query, ResultItem},
+    platform::windows::wide,
+};
 
 use super::{Provider, ProviderContext, ProviderOutput};
 
@@ -537,10 +540,6 @@ fn read_utf16_field(bytes: &[u8], offset: usize) -> Result<String, EverythingErr
         .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
         .collect();
     Ok(String::from_utf16_lossy(&utf16))
-}
-
-fn wide(value: &str) -> Vec<u16> {
-    value.encode_utf16().chain(Some(0)).collect()
 }
 
 pub(crate) fn everything_available() -> bool {

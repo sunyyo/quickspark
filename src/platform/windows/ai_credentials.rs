@@ -9,6 +9,8 @@ use windows_sys::Win32::{
     },
 };
 
+use super::wide;
+
 const AI_TARGET: &str = "QuickSpark/AI/APIKey";
 const TAVILY_TARGET: &str = "QuickSpark/Tavily/APIKey";
 
@@ -186,11 +188,4 @@ fn last_error(context: &str) -> String {
     format!("{context}（Windows 错误 {}）", unsafe {
         GetLastError()
     })
-}
-
-fn wide(value: &str) -> Vec<u16> {
-    std::ffi::OsStr::new(value)
-        .encode_wide()
-        .chain(Some(0))
-        .collect()
 }

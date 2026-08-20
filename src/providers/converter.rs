@@ -9,12 +9,6 @@ const PROVIDER_ID: &str = "converter";
 
 pub(crate) struct ConverterProvider;
 
-impl ConverterProvider {
-    pub(crate) fn new() -> Self {
-        Self
-    }
-}
-
 impl Provider for ConverterProvider {
     fn id(&self) -> &'static str {
         PROVIDER_ID

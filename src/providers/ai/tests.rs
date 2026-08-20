@@ -17,6 +17,36 @@ use super::{
 use crate::model::WebSearchMode;
 use crate::storage::{AiConfig, ReasoningEffort, ThinkingMode};
 
+fn read_http_request(stream: &mut impl Read) -> Vec<u8> {
+    let mut request = Vec::new();
+    let header_end = loop {
+        let mut chunk = [0u8; 4 * 1024];
+        let read = stream.read(&mut chunk).unwrap();
+        assert!(read > 0);
+        request.extend_from_slice(&chunk[..read]);
+        if let Some(position) = request.windows(4).position(|part| part == b"\r\n\r\n") {
+            break position + 4;
+        }
+    };
+    let header_text = String::from_utf8_lossy(&request[..header_end]);
+    let content_length = header_text
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())
+                .flatten()
+        })
+        .unwrap();
+    while request.len() < header_end + content_length {
+        let mut chunk = [0u8; 4 * 1024];
+        let read = stream.read(&mut chunk).unwrap();
+        assert!(read > 0);
+        request.extend_from_slice(&chunk[..read]);
+    }
+    request
+}
+
 #[test]
 fn recognizes_only_explicit_ai_prefix() {
     assert_eq!(ai_query("ai"), Some(""));
@@ -277,32 +307,7 @@ fn posts_to_a_local_openai_compatible_endpoint() {
         stream
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
-        let mut request = Vec::new();
-        let header_end = loop {
-            let mut chunk = [0u8; 4 * 1024];
-            let read = stream.read(&mut chunk).unwrap();
-            assert!(read > 0);
-            request.extend_from_slice(&chunk[..read]);
-            if let Some(position) = request.windows(4).position(|part| part == b"\r\n\r\n") {
-                break position + 4;
-            }
-        };
-        let header_text = String::from_utf8_lossy(&request[..header_end]);
-        let content_length = header_text
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().ok())
-                    .flatten()
-            })
-            .unwrap();
-        while request.len() < header_end + content_length {
-            let mut chunk = [0u8; 4 * 1024];
-            let read = stream.read(&mut chunk).unwrap();
-            assert!(read > 0);
-            request.extend_from_slice(&chunk[..read]);
-        }
+        let request = read_http_request(&mut stream);
         let request = String::from_utf8_lossy(&request);
         assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
         assert!(request.contains(concat!(
@@ -370,32 +375,7 @@ fn posts_bearer_authenticated_json_to_a_local_search_endpoint() {
         stream
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
-        let mut request = Vec::new();
-        let header_end = loop {
-            let mut chunk = [0u8; 4 * 1024];
-            let read = stream.read(&mut chunk).unwrap();
-            assert!(read > 0);
-            request.extend_from_slice(&chunk[..read]);
-            if let Some(position) = request.windows(4).position(|part| part == b"\r\n\r\n") {
-                break position + 4;
-            }
-        };
-        let header_text = String::from_utf8_lossy(&request[..header_end]);
-        let content_length = header_text
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().ok())
-                    .flatten()
-            })
-            .unwrap();
-        while request.len() < header_end + content_length {
-            let mut chunk = [0u8; 4 * 1024];
-            let read = stream.read(&mut chunk).unwrap();
-            assert!(read > 0);
-            request.extend_from_slice(&chunk[..read]);
-        }
+        let request = read_http_request(&mut stream);
         let request = String::from_utf8_lossy(&request);
         assert!(request.starts_with("POST /search HTTP/1.1"));
         assert!(
@@ -436,32 +416,7 @@ fn refuses_redirects_instead_of_forwarding_bearer_credentials() {
         stream
             .set_read_timeout(Some(Duration::from_secs(3)))
             .unwrap();
-        let mut request = Vec::new();
-        let header_end = loop {
-            let mut chunk = [0u8; 4 * 1024];
-            let read = stream.read(&mut chunk).unwrap();
-            assert!(read > 0);
-            request.extend_from_slice(&chunk[..read]);
-            if let Some(position) = request.windows(4).position(|part| part == b"\r\n\r\n") {
-                break position + 4;
-            }
-        };
-        let header_text = String::from_utf8_lossy(&request[..header_end]);
-        let content_length = header_text
-            .lines()
-            .find_map(|line| {
-                let (name, value) = line.split_once(':')?;
-                name.eq_ignore_ascii_case("content-length")
-                    .then(|| value.trim().parse::<usize>().ok())
-                    .flatten()
-            })
-            .unwrap();
-        while request.len() < header_end + content_length {
-            let mut chunk = [0u8; 4 * 1024];
-            let read = stream.read(&mut chunk).unwrap();
-            assert!(read > 0);
-            request.extend_from_slice(&chunk[..read]);
-        }
+        let request = read_http_request(&mut stream);
         assert!(
             String::from_utf8_lossy(&request)
                 .to_ascii_lowercase()

@@ -1,9 +1,11 @@
-use std::{env, os::windows::ffi::OsStrExt, path::PathBuf, ptr::null};
+use std::{env, path::PathBuf, ptr::null};
 
 use windows_sys::Win32::{
     Foundation::HWND,
     UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
 };
+
+use super::wide;
 
 pub(crate) unsafe fn shell_execute(
     owner: HWND,
@@ -32,11 +34,4 @@ pub(crate) fn windows_program(relative: &str) -> Option<String> {
     let root = PathBuf::from(env::var_os("SystemRoot")?);
     let path = root.is_absolute().then(|| root.join(relative))?;
     path.is_file().then(|| path.to_string_lossy().into_owned())
-}
-
-fn wide(value: &str) -> Vec<u16> {
-    std::ffi::OsStr::new(value)
-        .encode_wide()
-        .chain(Some(0))
-        .collect()
 }

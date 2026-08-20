@@ -18,12 +18,6 @@ const PROVIDER_ID: &str = "window-switcher";
 
 pub(crate) struct WindowSwitcherProvider;
 
-impl WindowSwitcherProvider {
-    pub(crate) fn new() -> Self {
-        Self
-    }
-}
-
 impl Provider for WindowSwitcherProvider {
     fn id(&self) -> &'static str {
         PROVIDER_ID
