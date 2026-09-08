@@ -65,12 +65,12 @@ use platform::windows::{
     prompt_tavily_api_key, shell_execute, show_ai_answer, show_ai_stream, update_ai_status, wide,
     windows_program,
 };
-use providers::UrlProvider;
 use providers::{
     AiEvent, AiService, ApplicationProvider, CalculatorProvider, CommandProvider,
     ConverterProvider, FileSearchProvider, HelpProvider, IndexError, ProviderContext,
     ProviderRegistry, SettingsProvider, SystemProvider, WebSearchProvider, WindowSwitcherProvider,
 };
+use providers::{DriveProvider, UrlProvider};
 use storage::{
     HotkeyChoice, Settings, load_light_theme, load_pinned, load_settings, load_usage,
     migrate_legacy_data, save_pinned, save_settings, save_theme, save_usage, set_autostart,
@@ -1382,6 +1382,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             providers.register(CommandProvider);
             providers.register(SystemProvider);
             providers.register(UrlProvider);
+            providers.register(DriveProvider);
             providers.register(WebSearchProvider);
             providers.register(CalculatorProvider);
             providers.register(ConverterProvider);

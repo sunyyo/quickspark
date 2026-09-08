@@ -88,6 +88,12 @@ const TOPICS: &[HelpTopic] = &[
         example: Some("; edit"),
     },
     HelpTopic {
+        title: "打开磁盘：输入 d: 后按 Enter",
+        details: "输入盘符（不区分大小写），按 Enter 打开对应磁盘根目录；也支持 D:\\ 和 D:/。",
+        keywords: "磁盘 硬盘 盘符 drive 根目录 打开",
+        example: Some("d:"),
+    },
+    HelpTopic {
         title: "直接打开网址：http://、https:// 或 www.",
         details: "粘贴完整 HTTP/HTTPS 网址，或输入 www. 开头的域名，按 Enter 使用默认浏览器打开。",
         keywords: "网址 网页 浏览器 url http https www 打开",
