@@ -48,6 +48,48 @@ fn checked_state_access_rejects_reentrant_aliases_without_panicking() {
 fn null_window_has_no_application_state() {
     assert!(unsafe { app_cell(std::ptr::null_mut()) }.is_none());
 }
+
+#[test]
+fn settings_selection_survives_value_changes_and_filtered_row_positions() {
+    use crate::model::SettingChange;
+    use crate::providers::{Provider, SettingsProvider};
+
+    let results = |settings: &Settings, input: &str| {
+        SettingsProvider
+            .query(
+                &Query::new(input),
+                &ProviderContext {
+                    usage: &HashMap::new(),
+                    now: 0,
+                    settings,
+                    pinned: &HashSet::new(),
+                    light_theme: true,
+                },
+            )
+            .results
+    };
+    let mut settings = Settings::default();
+    let before = results(&settings, "settings");
+    let position = super::setting_result_position(&before, SettingChange::CycleWebEngine).unwrap();
+    settings.web_engine = settings.web_engine.next();
+    let after = results(&settings, "settings");
+    assert_ne!(before[position].title, after[position].title);
+    assert_eq!(
+        super::setting_result_position(&after, SettingChange::CycleWebEngine),
+        Some(position)
+    );
+
+    let filtered = results(&settings, "设置 搜索引擎");
+    assert_eq!(
+        super::setting_result_position(&filtered, SettingChange::CycleWebEngine),
+        Some(0)
+    );
+    let other_setting = results(&settings, "设置 主题");
+    assert_eq!(
+        super::setting_result_position(&other_setting, SettingChange::CycleWebEngine),
+        None
+    );
+}
 use windows_sys::Win32::UI::WindowsAndMessaging::{WM_KEYDOWN, WM_SYSKEYDOWN};
 
 #[test]

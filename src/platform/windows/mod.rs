@@ -4,6 +4,7 @@ mod clipboard;
 mod date;
 mod markdown;
 mod shell;
+mod theme;
 mod window;
 
 pub(crate) use ai_credentials::{
@@ -17,6 +18,7 @@ pub(crate) use ai_window::{
 pub(crate) use clipboard::copy_text;
 pub(crate) use date::local_date;
 pub(crate) use shell::{shell_execute, windows_program};
+pub(crate) use theme::theme;
 pub(crate) use window::activate_window;
 
 pub(crate) fn wide(value: &str) -> Vec<u16> {

@@ -95,7 +95,7 @@ pub(super) unsafe fn render_thinking(state: &AnswerWindow) {
                 state.thinking_edit,
                 end,
                 240,
-                state.colors.muted,
+                state.colors.dim,
                 "Microsoft YaHei UI",
             );
         }

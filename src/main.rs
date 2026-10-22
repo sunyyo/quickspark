@@ -62,8 +62,8 @@ use model::{Action, Query, ResultItem, SettingChange, SystemCommand, Usage};
 use platform::windows::{
     ApiKeyPromptResult, activate_window, append_ai_answer, append_ai_reasoning, cancel_ai_answer,
     close_ai_answer, copy_text, fail_ai_answer, finish_ai_answer, prompt_ai_api_key,
-    prompt_tavily_api_key, shell_execute, show_ai_answer, show_ai_stream, update_ai_status, wide,
-    windows_program,
+    prompt_tavily_api_key, shell_execute, show_ai_answer, show_ai_stream, theme, update_ai_status,
+    wide, windows_program,
 };
 use providers::{
     AiEvent, AiService, ApplicationProvider, CalculatorProvider, CommandProvider,
@@ -99,7 +99,6 @@ const AI_WINDOW_CLOSED: u32 = WM_APP + 6;
 const WIDTH: i32 = 620;
 const HEIGHT: i32 = 306;
 const VISIBLE_RESULT_COUNT: usize = 8;
-const DARK_BG: u32 = 0x001E1A18;
 static TASKBAR_CREATED: OnceLock<u32> = OnceLock::new();
 
 type IndexResult = Result<ApplicationProvider, IndexError>;
@@ -125,37 +124,6 @@ struct App {
     indexing: bool,
     index_tx: Sender<IndexResult>,
     index_rx: Receiver<IndexResult>,
-}
-
-struct Theme {
-    bg: u32,
-    text: u32,
-    dim: u32,
-    muted: u32,
-    selected: u32,
-    divider: u32,
-}
-
-fn theme(light: bool) -> Theme {
-    if light {
-        Theme {
-            bg: 0x00F7F5F4,
-            text: 0x00242120,
-            dim: 0x005B5450,
-            muted: 0x00867B74,
-            selected: 0x00F3DDCC,
-            divider: 0x00DEDAD6,
-        }
-    } else {
-        Theme {
-            bg: DARK_BG,
-            text: 0x00F2EDE9,
-            dim: 0x00AAA39D,
-            muted: 0x00908780,
-            selected: 0x0052433B,
-            divider: 0x00332E2A,
-        }
-    }
 }
 
 fn now_seconds() -> u64 {
@@ -1168,6 +1136,23 @@ unsafe fn apply_setting_change(hwnd: HWND, change: SettingChange) {
         unsafe { show_action_error(hwnd, "设置已应用，但无法保存到磁盘。") };
     }
     unsafe { refresh(hwnd) };
+    // The label may change after applying a setting, so restore by action rather
+    // than title or row number (filtered settings can move or disappear).
+    if let Some((list, position)) = unsafe {
+        with_app(hwnd, |state| {
+            setting_result_position(&state.results, change).map(|position| (state.list, position))
+        })
+    }
+    .flatten()
+    {
+        unsafe { SendMessageW(list, LB_SETCURSEL, position, 0) };
+    }
+}
+
+fn setting_result_position(results: &[ResultItem], change: SettingChange) -> Option<usize> {
+    results
+        .iter()
+        .position(|result| result.primary_action() == Some(&Action::ChangeSetting { change }))
 }
 
 unsafe fn execute_system_command(hwnd: HWND, command: SystemCommand) -> bool {
