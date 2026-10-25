@@ -273,6 +273,68 @@ fn stale_completion_cannot_overwrite_a_newer_loading_request() {
 }
 
 #[test]
+fn terminal_events_keep_full_results_in_the_service_cache() {
+    let request = question_request("保留原问题");
+    let generation = AtomicU64::new(7);
+    let response = AiResponse {
+        answer: "完整回答".repeat(10_000),
+        reasoning: "完整思考".repeat(10_000),
+        finish_reason: Some("length".to_owned()),
+    };
+    for result in [Ok(response.clone()), Err("连接中断".to_owned())] {
+        let state = Mutex::new(AiState::Loading {
+            generation: 7,
+            request: request.clone(),
+        });
+        let event =
+            finish_event_if_current(&state, &generation, 7, request.clone(), result.clone())
+                .unwrap();
+        match (&event, &result) {
+            (
+                super::AiEvent::Finished {
+                    generation: 7,
+                    finish_reason,
+                },
+                Ok(response),
+            ) => assert_eq!(finish_reason, &response.finish_reason),
+            (
+                super::AiEvent::Failed {
+                    generation: 7,
+                    error,
+                },
+                Err(expected),
+            ) => assert_eq!(error, expected),
+            _ => panic!("unexpected terminal event: {event:?}"),
+        }
+        assert!(
+            matches!(&*lock_state(&state), AiState::Finished { request: saved, result: cached } if saved == &request && cached == &result)
+        );
+        assert!(finish_event_if_current(&state, &generation, 7, request.clone(), result).is_none());
+    }
+}
+
+#[test]
+fn answer_actions_preserve_borrowed_full_text_and_regeneration_request() {
+    let request = translation_request("--to en 你好").unwrap();
+    let response = AiResponse {
+        answer: "Hello. ".repeat(10_000),
+        reasoning: "翻译依据".repeat(10_000),
+        finish_reason: Some("stop".to_owned()),
+    };
+    let result = super::answer_result(&request, &response);
+    assert!(
+        matches!(&result.actions[0], crate::model::Action::ShowAiAnswer { prompt, answer, reasoning }
+        if prompt == &request.display_prompt && answer == &response.answer && reasoning == &response.reasoning)
+    );
+    assert!(
+        matches!(&result.actions[1], crate::model::Action::CopyText { text } if text == &response.answer)
+    );
+    assert!(
+        matches!(&result.actions[2], crate::model::Action::RegenerateAi { request: saved } if saved == &request)
+    );
+}
+
+#[test]
 fn decodes_sse_across_arbitrary_network_chunks() {
     let mut decoder = SseDecoder::default();
     assert!(
@@ -406,51 +468,65 @@ fn posts_bearer_authenticated_json_to_a_local_search_endpoint() {
 
 #[test]
 fn refuses_redirects_instead_of_forwarding_bearer_credentials() {
-    let redirected = TcpListener::bind("127.0.0.1:0").unwrap();
-    redirected.set_nonblocking(true).unwrap();
-    let redirected_address = redirected.local_addr().unwrap();
-    let initial = TcpListener::bind("127.0.0.1:0").unwrap();
-    let initial_address = initial.local_addr().unwrap();
-    let server = thread::spawn(move || {
-        let (mut stream, _) = initial.accept().unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
-        let request = read_http_request(&mut stream);
-        assert!(
-            String::from_utf8_lossy(&request)
-                .to_ascii_lowercase()
-                .contains("authorization: bearer redirect-secret")
-        );
-        write!(
+    for streaming in [true, false] {
+        let redirected = TcpListener::bind("127.0.0.1:0").unwrap();
+        redirected.set_nonblocking(true).unwrap();
+        let redirected_address = redirected.local_addr().unwrap();
+        let initial = TcpListener::bind("127.0.0.1:0").unwrap();
+        let initial_address = initial.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = initial.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let request = read_http_request(&mut stream);
+            assert!(
+                String::from_utf8_lossy(&request)
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer redirect-secret")
+            );
+            write!(
             stream,
             "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{redirected_address}/stolen\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
         )
         .unwrap();
-        stream.flush().unwrap();
-    });
+            stream.flush().unwrap();
+        });
 
-    let config = AiConfig {
-        api_url: format!("http://{initial_address}/v1/chat/completions"),
-        model: "local-test".to_owned(),
-        system_prompt: String::new(),
-        max_tokens: 32,
-        timeout_seconds: 5,
-        ..AiConfig::default()
-    };
-    let request = request_body(&config, &question_request("敏感问题"));
-    let error = winhttp_stream_json(
-        &config,
-        "redirect-secret",
-        &request,
-        RequestContext::standalone(),
-        |_| {},
-    )
-    .unwrap_err();
-    assert!(error.contains("HTTP 307"), "unexpected error: {error}");
-    server.join().unwrap();
-    assert!(matches!(
-        redirected.accept(),
-        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
-    ));
+        let config = AiConfig {
+            api_url: format!("http://{initial_address}/v1/chat/completions"),
+            model: "local-test".to_owned(),
+            system_prompt: String::new(),
+            max_tokens: 32,
+            timeout_seconds: 5,
+            ..AiConfig::default()
+        };
+        let request = request_body(&config, &question_request("敏感问题"));
+        let error = if streaming {
+            winhttp_stream_json(
+                &config,
+                "redirect-secret",
+                &request,
+                RequestContext::standalone(),
+                |_| {},
+            )
+            .unwrap_err()
+        } else {
+            winhttp_json(
+                &config.api_url,
+                "redirect-secret",
+                &request,
+                5,
+                RequestContext::standalone(),
+                "Tavily",
+            )
+            .unwrap_err()
+        };
+        assert!(error.contains("HTTP 307"), "unexpected error: {error}");
+        server.join().unwrap();
+        assert!(matches!(
+            redirected.accept(),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
+        ));
+    }
 }

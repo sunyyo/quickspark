@@ -111,7 +111,6 @@ struct App {
     font: HFONT,
     shortcut_font: HFONT,
     background: HBRUSH,
-    panel: HBRUSH,
     dpi: u32,
     light_theme: bool,
     usage: HashMap<String, Usage>,
@@ -962,39 +961,25 @@ unsafe fn toggle_theme(hwnd: HWND) {
     };
     let colors = theme(light_theme);
     let background = unsafe { CreateSolidBrush(colors.bg) };
-    let panel = unsafe { CreateSolidBrush(colors.bg) };
-    if background.is_null() || panel.is_null() {
-        unsafe {
-            if !background.is_null() {
-                DeleteObject(background as _);
-            }
-            if !panel.is_null() {
-                DeleteObject(panel as _);
-            }
-            show_action_error(hwnd, "无法创建主题绘制资源。")
-        };
+    if background.is_null() {
+        unsafe { show_action_error(hwnd, "无法创建主题绘制资源。") };
         return;
     }
     let swapped = unsafe {
         with_app_mut(hwnd, |state| {
-            let old = (state.background, state.panel, state.edit, state.list);
+            let old = (state.background, state.edit, state.list);
             state.light_theme = light_theme;
             state.background = background;
-            state.panel = panel;
             old
         })
     };
-    let Some((old_background, old_panel, edit, list)) = swapped else {
+    let Some((old_background, edit, list)) = swapped else {
         unsafe {
             DeleteObject(background as _);
-            DeleteObject(panel as _);
         }
         return;
     };
-    unsafe {
-        DeleteObject(old_background as _);
-        DeleteObject(old_panel as _)
-    };
+    unsafe { DeleteObject(old_background as _) };
     if !save_theme(light_theme) {
         unsafe {
             show_action_error(hwnd, "主题已切换，但无法保存；下次启动可能恢复原设置。")
@@ -1246,7 +1231,6 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                 )
             };
             let background = unsafe { CreateSolidBrush(colors.bg) };
-            let panel = unsafe { CreateSolidBrush(colors.bg) };
             let item_height = px(32, dpi);
             let edit = unsafe {
                 CreateWindowExW(
@@ -1287,7 +1271,6 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             if font.is_null()
                 || shortcut_font.is_null()
                 || background.is_null()
-                || panel.is_null()
                 || edit.is_null()
                 || list.is_null()
             {
@@ -1300,9 +1283,6 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                     }
                     if !background.is_null() {
                         DeleteObject(background as _);
-                    }
-                    if !panel.is_null() {
-                        DeleteObject(panel as _);
                     }
                     MessageBoxW(
                         hwnd,
@@ -1383,7 +1363,6 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                 font,
                 shortcut_font,
                 background,
-                panel,
                 dpi,
                 light_theme,
                 usage: load_usage(),
@@ -1577,8 +1556,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             0
         }
         WM_CTLCOLOREDIT | WM_CTLCOLORLISTBOX => {
-            let Some((light_theme, panel)) =
-                (unsafe { with_app(hwnd, |state| (state.light_theme, state.panel)) })
+            let Some((light_theme, background)) =
+                (unsafe { with_app(hwnd, |state| (state.light_theme, state.background)) })
             else {
                 return unsafe { DefWindowProcW(hwnd, msg, w, l) };
             };
@@ -1587,7 +1566,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                 SetTextColor(w as _, colors.text);
                 SetBkColor(w as _, colors.bg);
             }
-            panel as LRESULT
+            background as LRESULT
         }
         WM_ERASEBKGND => {
             let Some(background) = (unsafe { with_app(hwnd, |state| state.background) }) else {
@@ -1624,7 +1603,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
         WM_DRAWITEM => {
             let draw = unsafe { &*(l as *const DRAWITEMSTRUCT) };
             if draw.CtlID == LIST_ID as u32 && draw.itemID != u32::MAX {
-                let Some((light_theme, display_name, panel, dpi, font, shortcut_font)) = (unsafe {
+                let Some((light_theme, display_name, background, dpi, font, shortcut_font)) = (unsafe {
                     with_app(hwnd, |state| {
                         (
                             state.light_theme,
@@ -1632,7 +1611,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                                 .results
                                 .get(draw.itemID as usize)
                                 .map(|result| result.title.clone()),
-                            state.panel,
+                            state.background,
                             state.dpi,
                             state.font,
                             state.shortcut_font,
@@ -1644,7 +1623,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                 let colors = theme(light_theme);
                 if let Some(display_name) = display_name {
                     let selected = draw.itemState & ODS_SELECTED != 0;
-                    unsafe { FillRect(draw.hDC, &draw.rcItem, panel) };
+                    unsafe { FillRect(draw.hDC, &draw.rcItem, background) };
                     if selected {
                         let brush = unsafe { CreateSolidBrush(colors.selected) };
                         let old_brush = unsafe { SelectObject(draw.hDC, brush as _) };
@@ -1797,7 +1776,6 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                         DeleteObject(state.font as _);
                         DeleteObject(state.shortcut_font as _);
                         DeleteObject(state.background as _);
-                        DeleteObject(state.panel as _);
                     }
                 }
                 // If destruction was synchronously re-entered while state was borrowed,

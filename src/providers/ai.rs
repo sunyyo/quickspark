@@ -59,14 +59,10 @@ pub(crate) enum AiEvent {
     },
     Finished {
         generation: u64,
-        prompt: String,
-        answer: String,
-        reasoning: String,
         finish_reason: Option<String>,
     },
     Failed {
         generation: u64,
-        prompt: String,
         error: String,
     },
 }
@@ -88,7 +84,7 @@ enum StreamDelta {
     Answer(String),
 }
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 enum AiState {
     #[default]
     Idle,
@@ -147,11 +143,7 @@ impl AiService {
                 request: request.clone(),
                 result: Err(error.clone()),
             };
-            self.push_event(AiEvent::Failed {
-                generation,
-                prompt: request.display_prompt,
-                error,
-            });
+            self.push_event(AiEvent::Failed { generation, error });
             return generation;
         }
         let service = self.clone();
@@ -185,10 +177,6 @@ impl AiService {
         // for this lock will enqueue afterwards and post the next notification.
         self.notification_pending.store(false, Ordering::Release);
         drained
-    }
-
-    fn snapshot(&self) -> AiState {
-        lock_state(&self.state).clone()
     }
 
     fn push_event(&self, event: AiEvent) {
@@ -255,14 +243,10 @@ fn finish_event_if_current(
     let event = match &result {
         Ok(response) => AiEvent::Finished {
             generation,
-            prompt: request.display_prompt.clone(),
-            answer: response.answer.clone(),
-            reasoning: response.reasoning.clone(),
             finish_reason: response.finish_reason.clone(),
         },
         Err(error) => AiEvent::Failed {
             generation,
-            prompt: request.display_prompt.clone(),
             error: error.clone(),
         },
     };
@@ -348,7 +332,7 @@ impl AiProvider {
     fn request_output(&self, mut request: AiRequest) -> ProviderOutput {
         let config = load_ai_config();
         request.cache_key = request_cache_key(&request, &config);
-        match self.service.snapshot() {
+        match &*lock_state(&self.service.state) {
             AiState::Loading {
                 generation,
                 request: active,
@@ -372,8 +356,13 @@ impl AiProvider {
                 result: Err(error),
                 ..
             } if completed.cache_key == request.cache_key => message(
-                &format!("AI 请求失败：{}（按 Enter 重试）", preview(&error, 80)),
-                vec![Action::AskAi { request }, Action::CopyText { text: error }],
+                &format!("AI 请求失败：{}（按 Enter 重试）", preview(error, 80)),
+                vec![
+                    Action::AskAi { request },
+                    Action::CopyText {
+                        text: error.clone(),
+                    },
+                ],
             ),
             _ => {
                 if !config.is_ready() {
@@ -423,7 +412,7 @@ impl AiProvider {
             request,
             result: Ok(response),
             ..
-        } = self.service.snapshot()
+        } = &*lock_state(&self.service.state)
         {
             results.push(answer_result(request, response));
         }
@@ -481,7 +470,7 @@ impl AiProvider {
             request,
             result: Ok(response),
             ..
-        } = self.service.snapshot()
+        } = &*lock_state(&self.service.state)
             && request.result_label == TRANSLATION_LABEL
         {
             results.push(answer_result(request, response));
@@ -576,7 +565,7 @@ fn ai_settings() -> ProviderOutput {
     }
 }
 
-fn answer_result(request: AiRequest, response: AiResponse) -> ResultItem {
+fn answer_result(request: &AiRequest, response: &AiResponse) -> ResultItem {
     let display_prompt = request.display_prompt.clone();
     let reasoning = response.reasoning.clone();
     let answer = response.answer.clone();
@@ -595,7 +584,9 @@ fn answer_result(request: AiRequest, response: AiResponse) -> ResultItem {
                 reasoning,
             },
             Action::CopyText { text: answer },
-            Action::RegenerateAi { request },
+            Action::RegenerateAi {
+                request: request.clone(),
+            },
         ],
     }
 }

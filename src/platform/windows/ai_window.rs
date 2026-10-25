@@ -1,6 +1,8 @@
 use std::{
     borrow::Cow,
+    cell::RefCell,
     ptr::{null, null_mut},
+    rc::Rc,
     sync::OnceLock,
     time::Instant,
 };
@@ -15,7 +17,10 @@ use windows_sys::Win32::{
         HBRUSH, HDC, HFONT, InvalidateRect, OUT_DEFAULT_PRECIS, PS_SOLID, RoundRect, SelectObject,
         SetBkColor, SetBkMode, SetTextColor, TRANSPARENT, UpdateWindow,
     },
-    System::LibraryLoader::{GetModuleHandleW, LoadLibraryW},
+    System::{
+        LibraryLoader::{GetModuleHandleW, LoadLibraryW},
+        Threading::GetCurrentThreadId,
+    },
     UI::{
         Controls::{DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_SELECTED, SetWindowTheme},
         HiDpi::GetDpiForWindow,
@@ -28,14 +33,14 @@ use windows_sys::Win32::{
             BM_CLICK, BS_OWNERDRAW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CreateWindowExW,
             DefWindowProcW, DestroyWindow, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY,
             GetClientRect, GetNextDlgTabItem, GetWindowLongPtrW, GetWindowRect,
-            GetWindowTextLengthW, GetWindowTextW, IDC_ARROW, IsWindow, KillTimer, LoadCursorW,
-            MB_ICONERROR, MB_OK, MINMAXINFO, MessageBoxW, MoveWindow, PostMessageW, RegisterClassW,
-            SW_HIDE, SW_SHOW, SendMessageW, SetForegroundWindow, SetTimer, SetWindowLongPtrW,
-            SetWindowTextW, ShowWindow, WM_CLOSE, WM_COMMAND, WM_COPY, WM_CREATE, WM_CTLCOLORBTN,
-            WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM, WM_ERASEBKGND,
-            WM_GETMINMAXINFO, WM_KEYDOWN, WM_NCDESTROY, WM_SETFOCUS, WM_SETFONT, WM_SETREDRAW,
-            WM_SIZE, WM_TIMER, WNDCLASSW, WS_CHILD, WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW,
-            WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+            GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IDC_ARROW, IsWindow,
+            KillTimer, LoadCursorW, MB_ICONERROR, MB_OK, MINMAXINFO, MessageBoxW, MoveWindow,
+            PostMessageW, RegisterClassW, SW_HIDE, SW_SHOW, SendMessageW, SetForegroundWindow,
+            SetTimer, SetWindowLongPtrW, SetWindowTextW, ShowWindow, WM_CLOSE, WM_COMMAND, WM_COPY,
+            WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM,
+            WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_NCDESTROY, WM_SETFOCUS, WM_SETFONT,
+            WM_SETREDRAW, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CHILD, WS_EX_TOOLWINDOW,
+            WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
         },
     },
 };
@@ -154,13 +159,97 @@ struct AnswerWindow {
 static REGISTERED: OnceLock<bool> = OnceLock::new();
 static RICH_EDIT_LOADED: OnceLock<bool> = OnceLock::new();
 
-macro_rules! answer_state {
-    ($window:expr) => {{
-        #[allow(unused_unsafe)]
+// Drawing callbacks use fixed data without borrowing the mutable model that
+// initiated a synchronous Win32 repaint.
+#[derive(Clone, Copy)]
+struct AnswerPaint {
+    answer_edit: HWND,
+    thinking_edit: HWND,
+    hint: HWND,
+    hint_font: HFONT,
+    window_brush: HBRUSH,
+    answer_brush: HBRUSH,
+    colors: AnswerColors,
+}
+
+struct AnswerWindowState {
+    model: RefCell<AnswerWindow>,
+    paint: AnswerPaint,
+    window: HWND,
+}
+
+impl Drop for AnswerWindow {
+    fn drop(&mut self) {
         unsafe {
-            answer_window_ptr($window).as_mut()
+            for resource in [
+                self.heading_font as _,
+                self.body_font as _,
+                self.hint_font as _,
+                self.answer_font as _,
+                self.window_brush,
+                self.answer_brush,
+            ] {
+                if !resource.is_null() {
+                    let _released = DeleteObject(resource as _);
+                    #[cfg(test)]
+                    tests::record_resource_release(resource as usize, _released);
+                }
+            }
         }
-    }};
+    }
+}
+
+impl Drop for AnswerWindowState {
+    fn drop(&mut self) {
+        let model = self.model.get_mut();
+        // This can be later than WM_NCDESTROY if a callback is still using the
+        // model or its drawing resources. Notify only after that callback ends.
+        unsafe {
+            if model.streaming && model.cancel_message != 0 && !model.owner.is_null() {
+                PostMessageW(
+                    model.owner,
+                    model.cancel_message,
+                    model.generation as WPARAM,
+                    self.window as LPARAM,
+                );
+            }
+            if model.closed_message != 0 && !model.owner.is_null() {
+                PostMessageW(
+                    model.owner,
+                    model.closed_message,
+                    model.generation as WPARAM,
+                    self.window as LPARAM,
+                );
+            }
+        }
+    }
+}
+
+unsafe fn answer_window_state(window: HWND) -> Option<Rc<AnswerWindowState>> {
+    if unsafe { GetWindowThreadProcessId(window, null_mut()) != GetCurrentThreadId() } {
+        return None;
+    }
+    let pointer = unsafe { GetWindowLongPtrW(window, 0) } as *const AnswerWindowState;
+    if pointer.is_null() {
+        return None;
+    }
+    // Access is confined to the owning UI thread. Each callback retains an
+    // owner so synchronous window destruction cannot free its active borrow.
+    unsafe {
+        Rc::increment_strong_count(pointer);
+        Some(Rc::from_raw(pointer))
+    }
+}
+
+fn with_answer_state<R>(window: HWND, access: impl FnOnce(&mut AnswerWindow) -> R) -> Option<R> {
+    let state = unsafe { answer_window_state(window) }?;
+    let mut model = state.model.try_borrow_mut().ok()?;
+    Some(access(&mut model))
+}
+
+fn with_answer_paint<R>(window: HWND, access: impl FnOnce(&AnswerPaint) -> R) -> Option<R> {
+    let state = unsafe { answer_window_state(window) }?;
+    Some(access(&state.paint))
 }
 
 pub(crate) fn show_ai_answer(
@@ -209,14 +298,14 @@ pub(crate) fn update_ai_status(window: HWND, status: &str) -> bool {
     if window.is_null() || unsafe { IsWindow(window) } == 0 || status.is_empty() {
         return false;
     }
-    let Some(state) = answer_state!(window) else {
-        return false;
-    };
-    if !state.streaming {
-        return false;
-    }
-    unsafe { SetWindowTextW(state.hint, wide(status).as_ptr()) };
-    true
+    with_answer_state(window, |state| {
+        if !state.streaming {
+            return false;
+        }
+        unsafe { SetWindowTextW(state.hint, wide(status).as_ptr()) };
+        true
+    })
+    .unwrap_or(false)
 }
 
 fn show_answer_window(mut init: AnswerInit) -> Option<HWND> {
@@ -269,45 +358,45 @@ pub(crate) fn append_ai_reasoning(window: HWND, text: &str) -> bool {
     if window.is_null() || unsafe { IsWindow(window) } == 0 {
         return false;
     }
-    let Some(state) = answer_state!(window) else {
-        return false;
-    };
-    if !state.streaming || state.thinking_complete || text.is_empty() {
-        return false;
-    }
-    if state.reasoning.is_empty() {
-        state.thinking_started.get_or_insert_with(Instant::now);
-        state.thinking_visible = true;
-    }
-    state.reasoning.push_str(text);
-    state.reasoning_chars = state.reasoning_chars.saturating_add(text.chars().count());
-    unsafe {
-        schedule_thinking_render(window, state);
-        SetWindowTextW(state.hint, wide("正在思考…").as_ptr());
-        EnableWindow(state.thinking_toggle, 1);
-        EnableWindow(state.thinking_copy, 1);
-    }
-    true
+    with_answer_state(window, |state| {
+        if !state.streaming || state.thinking_complete || text.is_empty() {
+            return false;
+        }
+        if state.reasoning.is_empty() {
+            state.thinking_started.get_or_insert_with(Instant::now);
+            state.thinking_visible = true;
+        }
+        state.reasoning.push_str(text);
+        state.reasoning_chars = state.reasoning_chars.saturating_add(text.chars().count());
+        unsafe {
+            schedule_thinking_render(window, state);
+            SetWindowTextW(state.hint, wide("正在思考…").as_ptr());
+            EnableWindow(state.thinking_toggle, 1);
+            EnableWindow(state.thinking_copy, 1);
+        }
+        true
+    })
+    .unwrap_or(false)
 }
 
 pub(crate) fn append_ai_answer(window: HWND, text: &str) -> bool {
     if window.is_null() || unsafe { IsWindow(window) } == 0 {
         return false;
     }
-    let Some(state) = answer_state!(window) else {
-        return false;
-    };
-    if !state.streaming {
-        return false;
-    }
-    unsafe { complete_thinking(window, state) };
-    state.answer.push_str(text);
-    unsafe {
-        schedule_render(window, state);
-        SetWindowTextW(state.hint, wide("正在回答…").as_ptr());
-        SetWindowTextW(state.copy_button, wide("复制回答").as_ptr());
-    }
-    true
+    with_answer_state(window, |state| {
+        if !state.streaming {
+            return false;
+        }
+        unsafe { complete_thinking(window, state) };
+        state.answer.push_str(text);
+        unsafe {
+            schedule_render(window, state);
+            SetWindowTextW(state.hint, wide("正在回答…").as_ptr());
+            SetWindowTextW(state.copy_button, wide("复制回答").as_ptr());
+        }
+        true
+    })
+    .unwrap_or(false)
 }
 
 pub(crate) fn finish_ai_answer(window: HWND, finish_reason: Option<&str>) {
@@ -324,10 +413,10 @@ pub(crate) fn fail_ai_answer(window: HWND, error: &str) {
     if window.is_null() || unsafe { IsWindow(window) } == 0 {
         return;
     }
-    let Some(state) = answer_state!(window) else {
+    let Some(empty) = with_answer_state(window, |state| state.answer.is_empty()) else {
         return;
     };
-    let message = if state.answer.is_empty() {
+    let message = if empty {
         format!("请求失败：{error}")
     } else {
         format!("\n\n[请求中断] {error}")
@@ -371,9 +460,7 @@ unsafe extern "system" fn answer_window_proc(
     match message {
         WM_CREATE => unsafe { create_answer_window(window, lparam) },
         WM_SIZE => {
-            if let Some(state) = answer_state!(window) {
-                unsafe { layout(window, state) };
-            }
+            with_answer_state(window, |state| unsafe { layout(window, state) });
             0
         }
         WM_GETMINMAXINFO => {
@@ -383,193 +470,163 @@ unsafe extern "system" fn answer_window_proc(
             limits.ptMinTrackSize.y = scale(520, dpi);
             0
         }
-        WM_DRAWITEM => {
-            if let Some(state) = answer_state!(window) {
-                let draw = unsafe { &*(lparam as *const DRAWITEMSTRUCT) };
-                unsafe { draw_button(draw, state) };
-                return 1;
-            }
-            unsafe { DefWindowProcW(window, message, wparam, lparam) }
-        }
+        WM_DRAWITEM => with_answer_paint(window, |paint| {
+            let draw = unsafe { &*(lparam as *const DRAWITEMSTRUCT) };
+            unsafe { draw_button(draw, paint) };
+            1
+        })
+        .unwrap_or_else(|| unsafe { DefWindowProcW(window, message, wparam, lparam) }),
         WM_SETFOCUS => {
-            if let Some(state) = answer_state!(window) {
-                unsafe { SetFocus(state.answer_edit) };
-            }
+            with_answer_paint(window, |paint| unsafe { SetFocus(paint.answer_edit) });
             0
         }
         WM_TIMER if wparam == RENDER_TIMER_ID => {
-            if let Some(state) = answer_state!(window) {
-                unsafe { flush_render(window, state) };
-            }
+            with_answer_state(window, |state| unsafe { flush_render(window, state) });
             0
         }
         WM_TIMER if wparam == THINK_RENDER_TIMER_ID => {
-            if let Some(state) = answer_state!(window) {
-                unsafe { flush_thinking_render(window, state) };
-            }
+            with_answer_state(window, |state| unsafe {
+                flush_thinking_render(window, state)
+            });
             0
         }
         WM_COMMAND => {
-            let command = wparam & 0xffff;
-            if command == COPY_BUTTON_ID {
-                if let Some(state) = answer_state!(window) {
-                    if copy_text(window, &state.answer) {
-                        unsafe {
-                            SetWindowTextW(state.copy_button, wide("已复制").as_ptr());
-                            SetFocus(state.answer_edit);
+            match wparam & 0xffff {
+                COPY_BUTTON_ID => copy_answer(window, false),
+                COPY_THINKING_ID => copy_answer(window, true),
+                THINK_TOGGLE_ID => {
+                    with_answer_state(window, |state| {
+                        if !state.reasoning.is_empty() {
+                            unsafe { toggle_thinking(window, state) };
                         }
-                    } else {
-                        unsafe {
-                            MessageBoxW(
-                                window,
-                                wide("无法复制 AI 回答。").as_ptr(),
-                                wide("QuickSpark AI").as_ptr(),
-                                MB_OK | MB_ICONERROR,
-                            )
-                        };
-                    }
+                    });
                 }
-                return 0;
+                STOP_BUTTON_ID => unsafe { notify_cancel(window) },
+                CLOSE_BUTTON_ID => unsafe {
+                    notify_cancel(window);
+                    DestroyWindow(window);
+                },
+                _ => return unsafe { DefWindowProcW(window, message, wparam, lparam) },
             }
-            if command == COPY_THINKING_ID {
-                if let Some(state) = answer_state!(window)
-                    && !state.reasoning.is_empty()
-                {
-                    if copy_text(window, &state.reasoning) {
-                        unsafe {
-                            SetWindowTextW(state.thinking_copy, wide("已复制").as_ptr());
-                            SetFocus(state.answer_edit);
-                        }
-                    } else {
-                        unsafe {
-                            MessageBoxW(
-                                window,
-                                wide("无法复制完整思考过程。").as_ptr(),
-                                wide("QuickSpark AI").as_ptr(),
-                                MB_OK | MB_ICONERROR,
-                            )
-                        };
-                    }
-                }
-                return 0;
-            }
-            if command == THINK_TOGGLE_ID {
-                if let Some(state) = answer_state!(window)
-                    && !state.reasoning.is_empty()
-                {
-                    unsafe { toggle_thinking(window, state) };
-                }
-                return 0;
-            }
-            if command == STOP_BUTTON_ID {
-                unsafe { notify_cancel(window) };
-                return 0;
-            }
-            if command == CLOSE_BUTTON_ID {
-                unsafe { notify_cancel(window) };
-                unsafe { DestroyWindow(window) };
-                return 0;
-            }
-            unsafe { DefWindowProcW(window, message, wparam, lparam) }
+            0
         }
-        WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT => {
-            if let Some(state) = answer_state!(window) {
-                let control = lparam as HWND;
-                let dc = wparam as HDC;
-                if control == state.answer_edit || control == state.thinking_edit {
-                    unsafe {
-                        SetTextColor(
-                            dc,
-                            if control == state.thinking_edit {
-                                state.colors.dim
-                            } else {
-                                state.colors.text
-                            },
-                        );
-                        SetBkColor(dc, state.colors.answer_bg);
-                    }
-                    return state.answer_brush as LRESULT;
-                }
+        WM_CTLCOLORSTATIC | WM_CTLCOLOREDIT => with_answer_paint(window, |paint| {
+            let control = lparam as HWND;
+            let dc = wparam as HDC;
+            if control == paint.answer_edit || control == paint.thinking_edit {
                 unsafe {
-                    SetBkMode(dc, TRANSPARENT as i32);
                     SetTextColor(
                         dc,
-                        if control == state.hint {
-                            state.colors.dim
+                        if control == paint.thinking_edit {
+                            paint.colors.dim
                         } else {
-                            state.colors.text
+                            paint.colors.text
                         },
                     );
+                    SetBkColor(dc, paint.colors.answer_bg);
                 }
-                return state.window_brush as LRESULT;
+                return paint.answer_brush as LRESULT;
             }
-            unsafe { DefWindowProcW(window, message, wparam, lparam) }
-        }
-        WM_CTLCOLORBTN => {
-            if let Some(state) = answer_state!(window) {
-                let dc = wparam as HDC;
-                unsafe {
-                    SetBkMode(dc, TRANSPARENT as i32);
-                    SetTextColor(dc, state.colors.text);
-                    SetBkColor(dc, state.colors.bg);
-                }
-                return state.window_brush as LRESULT;
+            unsafe {
+                SetBkMode(dc, TRANSPARENT as i32);
+                SetTextColor(
+                    dc,
+                    if control == paint.hint {
+                        paint.colors.dim
+                    } else {
+                        paint.colors.text
+                    },
+                );
             }
-            unsafe { DefWindowProcW(window, message, wparam, lparam) }
-        }
-        WM_ERASEBKGND => {
-            if let Some(state) = answer_state!(window) {
-                let mut rect: RECT = unsafe { std::mem::zeroed() };
-                unsafe {
-                    GetClientRect(window, &mut rect);
-                    FillRect(wparam as HDC, &rect, state.window_brush);
-                }
-                return 1;
+            paint.window_brush as LRESULT
+        })
+        .unwrap_or_else(|| unsafe { DefWindowProcW(window, message, wparam, lparam) }),
+        WM_CTLCOLORBTN => with_answer_paint(window, |paint| {
+            let dc = wparam as HDC;
+            unsafe {
+                SetBkMode(dc, TRANSPARENT as i32);
+                SetTextColor(dc, paint.colors.text);
+                SetBkColor(dc, paint.colors.bg);
             }
-            unsafe { DefWindowProcW(window, message, wparam, lparam) }
-        }
+            paint.window_brush as LRESULT
+        })
+        .unwrap_or_else(|| unsafe { DefWindowProcW(window, message, wparam, lparam) }),
+        WM_ERASEBKGND => with_answer_paint(window, |paint| {
+            let mut rect: RECT = unsafe { std::mem::zeroed() };
+            unsafe {
+                GetClientRect(window, &mut rect);
+                FillRect(wparam as HDC, &rect, paint.window_brush);
+            }
+            1
+        })
+        .unwrap_or_else(|| unsafe { DefWindowProcW(window, message, wparam, lparam) }),
         WM_CLOSE => {
-            unsafe { notify_cancel(window) };
-            unsafe { DestroyWindow(window) };
+            unsafe {
+                notify_cancel(window);
+                DestroyWindow(window);
+            }
             0
         }
         WM_DESTROY => {
-            unsafe { KillTimer(window, RENDER_TIMER_ID) };
-            unsafe { KillTimer(window, THINK_RENDER_TIMER_ID) };
+            unsafe {
+                KillTimer(window, RENDER_TIMER_ID);
+                KillTimer(window, THINK_RENDER_TIMER_ID);
+            }
             0
         }
         WM_NCDESTROY => {
-            let pointer = unsafe { GetWindowLongPtrW(window, 0) } as *mut AnswerWindow;
+            let pointer = unsafe { GetWindowLongPtrW(window, 0) } as *const AnswerWindowState;
             if !pointer.is_null() {
-                // Detach the pointer first so no re-entrant teardown message can
-                // access state after it has been freed.
-                unsafe { SetWindowLongPtrW(window, 0, 0) };
-                let state = unsafe { Box::from_raw(pointer) };
-                let owner = state.owner;
-                let closed_message = state.closed_message;
-                let generation = state.generation;
+                // Re-entrant callbacks must stop finding this window's owner.
                 unsafe {
-                    DeleteObject(state.heading_font as _);
-                    DeleteObject(state.body_font as _);
-                    DeleteObject(state.hint_font as _);
-                    DeleteObject(state.answer_font as _);
-                    DeleteObject(state.window_brush as _);
-                    DeleteObject(state.answer_brush as _);
-                }
-                if closed_message != 0 && !owner.is_null() {
-                    unsafe {
-                        PostMessageW(
-                            owner,
-                            closed_message,
-                            generation as WPARAM,
-                            window as LPARAM,
-                        )
-                    };
+                    SetWindowLongPtrW(window, 0, 0);
+                    drop(Rc::from_raw(pointer));
                 }
             }
             0
         }
         _ => unsafe { DefWindowProcW(window, message, wparam, lparam) },
+    }
+}
+
+fn copy_answer(window: HWND, thinking: bool) {
+    // Clipboard APIs and error dialogs can pump messages. Never keep a model
+    // borrow alive while they run, or incoming streaming updates could be lost.
+    let Some((text, button, answer_edit)) = with_answer_state(window, |state| {
+        if thinking {
+            (
+                state.reasoning.clone(),
+                state.thinking_copy,
+                state.answer_edit,
+            )
+        } else {
+            (state.answer.clone(), state.copy_button, state.answer_edit)
+        }
+    }) else {
+        return;
+    };
+    if thinking && text.is_empty() {
+        return;
+    }
+    if copy_text(window, &text) {
+        unsafe {
+            SetWindowTextW(button, wide("已复制").as_ptr());
+            SetFocus(answer_edit);
+        }
+    } else {
+        let message = if thinking {
+            "无法复制完整思考过程。"
+        } else {
+            "无法复制 AI 回答。"
+        };
+        unsafe {
+            MessageBoxW(
+                window,
+                wide(message).as_ptr(),
+                wide("QuickSpark AI").as_ptr(),
+                MB_OK | MB_ICONERROR,
+            );
+        }
     }
 }
 
@@ -644,7 +701,7 @@ unsafe fn create_answer_window(window: HWND, lparam: LPARAM) -> LRESULT {
     let reasoning_chars = reasoning.chars().count();
     let thinking_visible = init.streaming || !reasoning.is_empty();
     let colors = answer_colors(init.light_theme);
-    let state = Box::new(AnswerWindow {
+    let state = AnswerWindow {
         question_label,
         prompt,
         answer_label,
@@ -680,26 +737,26 @@ unsafe fn create_answer_window(window: HWND, lparam: LPARAM) -> LRESULT {
         closed_message: init.closed_message,
         generation: init.generation,
         streaming: init.streaming,
-    });
+    };
     if state.window_brush.is_null() || state.answer_brush.is_null() {
-        unsafe {
-            DeleteObject(state.heading_font as _);
-            DeleteObject(state.body_font as _);
-            DeleteObject(state.hint_font as _);
-            DeleteObject(state.answer_font as _);
-            if !state.window_brush.is_null() {
-                DeleteObject(state.window_brush as _);
-            }
-            if !state.answer_brush.is_null() {
-                DeleteObject(state.answer_brush as _);
-            }
-        }
         return -1;
     }
-    let pointer = Box::into_raw(state);
-    unsafe { SetWindowLongPtrW(window, 0, pointer as isize) };
-    let state = unsafe { &mut *pointer };
-    unsafe {
+    let paint = AnswerPaint {
+        answer_edit: state.answer_edit,
+        thinking_edit: state.thinking_edit,
+        hint: state.hint,
+        hint_font: state.hint_font,
+        window_brush: state.window_brush,
+        answer_brush: state.answer_brush,
+        colors: state.colors,
+    };
+    let owner = Rc::new(AnswerWindowState {
+        model: RefCell::new(state),
+        paint,
+        window,
+    });
+    unsafe { SetWindowLongPtrW(window, 0, Rc::into_raw(owner) as isize) };
+    with_answer_state(window, |state| unsafe {
         for control in [state.question_label, state.answer_label] {
             SendMessageW(control, WM_SETFONT, state.heading_font as WPARAM, 1);
         }
@@ -780,7 +837,7 @@ unsafe fn create_answer_window(window: HWND, lparam: LPARAM) -> LRESULT {
         }
         layout(window, state);
         SetFocus(state.answer_edit);
-    }
+    });
     0
 }
 
@@ -975,55 +1032,54 @@ unsafe fn layout(window: HWND, state: &AnswerWindow) {
 }
 
 unsafe fn notify_cancel(window: HWND) {
-    let Some(state) = answer_state!(window) else {
-        return;
-    };
-    if !state.streaming {
-        return;
-    }
-    unsafe { complete_thinking(window, state) };
-    state.streaming = false;
-    state.render_dirty = true;
-    unsafe { flush_render(window, state) };
-    unsafe {
-        if GetFocus() == state.stop_button {
-            SetFocus(state.answer_edit);
+    with_answer_state(window, |state| {
+        if !state.streaming {
+            return;
         }
-        EnableWindow(state.stop_button, 0);
-        ShowWindow(state.stop_button, SW_HIDE);
-        SetWindowTextW(state.hint, wide("正在停止生成…").as_ptr());
-        layout(window, state);
-        PostMessageW(
-            state.owner,
-            state.cancel_message,
-            state.generation as WPARAM,
-            window as LPARAM,
-        );
-    }
+        unsafe { complete_thinking(window, state) };
+        state.streaming = false;
+        state.render_dirty = true;
+        unsafe { flush_render(window, state) };
+        unsafe {
+            if GetFocus() == state.stop_button {
+                SetFocus(state.answer_edit);
+            }
+            EnableWindow(state.stop_button, 0);
+            ShowWindow(state.stop_button, SW_HIDE);
+            SetWindowTextW(state.hint, wide("正在停止生成…").as_ptr());
+            layout(window, state);
+            PostMessageW(
+                state.owner,
+                state.cancel_message,
+                state.generation as WPARAM,
+                window as LPARAM,
+            );
+        }
+    });
 }
 
 unsafe fn set_stream_state(window: HWND, status: &str) {
-    if window.is_null() || unsafe { IsWindow(window) } == 0 {
-        return;
-    }
-    let Some(state) = answer_state!(window) else {
-        return;
-    };
-    unsafe { complete_thinking(window, state) };
-    state.streaming = false;
-    // The last streaming paint is intentionally plain text. Always perform one
-    // final Markdown pass, even if no delta arrived since the previous timer.
-    state.render_dirty = true;
-    unsafe { flush_render(window, state) };
-    unsafe {
-        SetWindowTextW(state.hint, wide(status).as_ptr());
-        if GetFocus() == state.stop_button {
-            SetFocus(state.answer_edit);
+    with_answer_state(window, |state| {
+        if window.is_null() || unsafe { IsWindow(window) } == 0 {
+            return;
         }
-        EnableWindow(state.stop_button, 0);
-        ShowWindow(state.stop_button, SW_HIDE);
-        layout(window, state);
-    }
+
+        unsafe { complete_thinking(window, state) };
+        state.streaming = false;
+        // The last streaming paint is intentionally plain text. Always perform one
+        // final Markdown pass, even if no delta arrived since the previous timer.
+        state.render_dirty = true;
+        unsafe { flush_render(window, state) };
+        unsafe {
+            SetWindowTextW(state.hint, wide(status).as_ptr());
+            if GetFocus() == state.stop_button {
+                SetFocus(state.answer_edit);
+            }
+            EnableWindow(state.stop_button, 0);
+            ShowWindow(state.stop_button, SW_HIDE);
+            layout(window, state);
+        }
+    });
 }
 
 unsafe fn schedule_render(window: HWND, state: &mut AnswerWindow) {
@@ -1218,10 +1274,6 @@ unsafe fn create_answer_edit(parent: HWND) -> (HWND, bool) {
     (edit, false)
 }
 
-unsafe fn answer_window_ptr(window: HWND) -> *mut AnswerWindow {
-    unsafe { GetWindowLongPtrW(window, 0) as *mut AnswerWindow }
-}
-
 unsafe fn create_static(parent: HWND, text: &str) -> HWND {
     unsafe {
         CreateWindowExW(
@@ -1261,7 +1313,7 @@ unsafe fn create_button(parent: HWND, text: &str, id: usize) -> HWND {
 }
 
 // Keep native button semantics while matching the launcher's flat surfaces.
-unsafe fn draw_button(draw: &DRAWITEMSTRUCT, state: &AnswerWindow) {
+unsafe fn draw_button(draw: &DRAWITEMSTRUCT, state: &AnswerPaint) {
     let dpi = unsafe { GetDpiForWindow(draw.hwndItem) }.max(96);
     let quiet = matches!(draw.CtlID as usize, THINK_TOGGLE_ID | COPY_THINKING_ID);
     let disabled = draw.itemState & ODS_DISABLED != 0;
