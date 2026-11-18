@@ -188,12 +188,17 @@ unsafe fn set_launcher_query(hwnd: HWND, value: &str) {
 }
 
 unsafe fn refresh(hwnd: HWND) {
+    let previous = unsafe { selected_result_position(hwnd) };
+    unsafe { refresh_results(hwnd, previous) };
+}
+
+unsafe fn refresh_results(hwnd: HWND, previous: Option<usize>) {
     let Some(edit) = (unsafe { with_app(hwnd, |state| state.edit) }) else {
         return;
     };
     let input = unsafe { query(edit) };
     let query = Query::new(&input);
-    let Some((list, titles)) = (unsafe {
+    let Some((list, titles, selected)) = (unsafe {
         with_app_mut(hwnd, |state| {
             let context = ProviderContext {
                 usage: &state.usage,
@@ -202,15 +207,26 @@ unsafe fn refresh(hwnd: HWND) {
                 pinned: &state.pinned,
                 light_theme: state.light_theme,
             };
-            state.results = state
+            let results = state
                 .providers
                 .query(&query, &context, state.settings.result_limit);
+            let selected = previous
+                .and_then(|i| state.results.get(i))
+                .and_then(|old| {
+                    results.iter().position(|new| {
+                        old.provider_id == new.provider_id
+                            && old.primary_action() == new.primary_action()
+                            && (old.primary_action().is_some() || old.title == new.title)
+                    })
+                })
+                .unwrap_or(0);
+            state.results = results;
             let titles = state
                 .results
                 .iter()
                 .map(|result| result.title.clone())
                 .collect::<Vec<_>>();
-            (state.list, titles)
+            (state.list, titles, selected)
         })
     }) else {
         return;
@@ -222,7 +238,7 @@ unsafe fn refresh(hwnd: HWND) {
         unsafe { SendMessageW(list, LB_ADDSTRING, 0, label.as_ptr() as LPARAM) };
     }
     if !titles.is_empty() {
-        unsafe { SendMessageW(list, LB_SETCURSEL, 0, 0) };
+        unsafe { SendMessageW(list, LB_SETCURSEL, selected, 0) };
     }
 }
 
@@ -455,15 +471,17 @@ unsafe fn execute_action(hwnd: HWND, action: Action) {
             prompt,
             answer,
             reasoning,
+            completion,
         } => {
             let light_theme = unsafe { with_app(hwnd, |state| state.light_theme) }.unwrap_or(true);
-            if !show_ai_answer(hwnd, &prompt, &answer, &reasoning, light_theme) {
+            if show_ai_answer(hwnd, &prompt, &answer, &reasoning, completion, light_theme).is_none()
+            {
                 unsafe { show_action_error(hwnd, "无法打开 AI 回答窗口。") };
             }
             return;
         }
         Action::ConfigureAiKey => {
-            match prompt_ai_api_key(hwnd) {
+            match prompt_ai_api_key(hwnd, &storage::load_ai_config().api_url) {
                 Ok(ApiKeyPromptResult::Saved) => unsafe {
                     MessageBoxW(
                         hwnd,
@@ -632,19 +650,18 @@ fn modifier_pressed(key: i32) -> bool {
     unsafe { GetKeyState(key) as u16 & 0x8000 != 0 }
 }
 
-unsafe fn handle_action_shortcut(hwnd: HWND, key: u16) -> bool {
-    let control = modifier_pressed(VK_CONTROL as i32);
-    let shift = modifier_pressed(VK_SHIFT as i32);
+unsafe fn handle_action_shortcut(hwnd: HWND, key: u16, control: bool, shift: bool) -> bool {
     if key == VK_TAB {
         unsafe { show_result_actions(hwnd) };
         return true;
     }
     if control && key == VK_RETURN {
-        return unsafe {
+        unsafe {
             launch_selected_matching(hwnd, |action| {
                 matches!(action, Action::RunAsAdministrator { .. })
-            })
-        };
+            });
+        }
+        return true;
     }
     if control && shift && key == 0x45 {
         return unsafe {
@@ -661,8 +678,8 @@ unsafe fn handle_action_shortcut(hwnd: HWND, key: u16) -> bool {
     false
 }
 
-fn alt_shortcut_index(message: u32, key: WPARAM) -> Option<usize> {
-    if message == WM_SYSKEYDOWN && (0x31..=0x38).contains(&(key as u32)) {
+fn alt_shortcut_index(message: u32, key: WPARAM, launcher_active: bool) -> Option<usize> {
+    if launcher_active && message == WM_SYSKEYDOWN && (0x31..=0x38).contains(&(key as u32)) {
         Some(key - 0x31)
     } else {
         None
@@ -907,7 +924,7 @@ unsafe fn show_launcher(hwnd: HWND) {
         SetWindowTextW(edit, wide("").as_ptr());
         SetFocus(edit)
     };
-    unsafe { refresh(hwnd) };
+    unsafe { refresh_results(hwnd, None) };
 }
 
 unsafe fn show_manual(hwnd: HWND) {
@@ -1341,6 +1358,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             };
             let (index_tx, index_rx) = mpsc::channel();
             let mut providers = ProviderRegistry::new();
+            let _ = storage::ai_config_file();
             let ai_service = AiService::new(hwnd as usize, AI_READY);
             providers.register(HelpProvider);
             providers.register(SettingsProvider);
@@ -1491,8 +1509,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                     append_ai_answer(answer_window, &answer_delta);
                 }
                 match terminal.as_ref() {
-                    Some(AiEvent::Finished { finish_reason, .. }) => {
-                        finish_ai_answer(answer_window, finish_reason.as_deref())
+                    Some(AiEvent::Finished { completion, .. }) => {
+                        finish_ai_answer(answer_window, *completion)
                     }
                     Some(AiEvent::Failed { error, .. }) => fail_ai_answer(answer_window, error),
                     _ => {}
@@ -1506,20 +1524,21 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
         AI_CANCEL => {
             let generation = w as u64;
             let answer_window = l as HWND;
-            let answer_window_destroyed = unsafe { IsWindow(answer_window) } == 0;
-            let _ = unsafe {
+            let cancelled = unsafe {
                 with_app_mut(hwnd, |state| {
-                    if state.ai_generation == generation {
-                        state.ai_service.cancel();
-                        if state.ai_window == answer_window && answer_window_destroyed {
-                            state.ai_window = null_mut();
-                            state.ai_generation = 0;
-                        }
+                    if answer_window.is_null()
+                        || state.ai_generation != generation
+                        || state.ai_window != answer_window
+                    {
+                        return false;
                     }
+                    state.ai_service.cancel();
+                    true
                 })
             };
-            cancel_ai_answer(answer_window);
-            unsafe { refresh(hwnd) };
+            if cancelled == Some(true) {
+                unsafe { refresh(hwnd) };
+            }
             0
         }
         AI_WINDOW_CLOSED => {
@@ -1529,6 +1548,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                 with_app_mut(hwnd, |state| {
                     if state.ai_generation == generation && state.ai_window == answer_window {
                         state.ai_window = null_mut();
+                        state.ai_generation = 0;
                     }
                 })
             };
@@ -1733,7 +1753,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             let id = (w & 0xffff) as i32;
             let code = ((w >> 16) & 0xffff) as u16;
             if id == EDIT_ID && code == EN_CHANGE as u16 {
-                unsafe { refresh(hwnd) };
+                unsafe { refresh_results(hwnd, None) };
             }
             if id == LIST_ID && code == LBN_DBLCLK as u16 {
                 unsafe { launch_selected(hwnd) };
@@ -1853,30 +1873,37 @@ fn main() {
         );
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
-            if let Some(position) = alt_shortcut_index(msg.message, msg.wParam) {
-                launch_result(hwnd, position);
-                continue;
-            }
             let launcher_control = with_app(hwnd, |state| {
                 msg.hwnd == state.edit || msg.hwnd == state.list
             })
             .unwrap_or(false);
-            if msg.message == WM_KEYDOWN
-                && msg.wParam as u16 == VK_F1
-                && (msg.hwnd == hwnd || launcher_control)
-            {
+            let launcher_target = msg.hwnd == hwnd || launcher_control;
+            if let Some(position) = alt_shortcut_index(
+                msg.message,
+                msg.wParam,
+                launcher_target && IsWindowVisible(hwnd) != 0,
+            ) {
+                launch_result(hwnd, position);
+                continue;
+            }
+            if msg.message == WM_KEYDOWN && msg.wParam as u16 == VK_F1 && launcher_target {
                 show_manual(hwnd);
                 continue;
             }
-            if msg.message == WM_MOUSEWHEEL && (msg.hwnd == hwnd || launcher_control) {
+            if msg.message == WM_MOUSEWHEEL && launcher_target {
                 let delta = wheel_selection_delta(msg.wParam);
                 if delta != 0 {
                     move_selection(hwnd, delta);
                 }
                 continue;
             }
-            if msg.message == WM_KEYDOWN && launcher_control {
-                if handle_action_shortcut(hwnd, msg.wParam as u16) {
+            if msg.message == WM_KEYDOWN && launcher_target {
+                if handle_action_shortcut(
+                    hwnd,
+                    msg.wParam as u16,
+                    modifier_pressed(VK_CONTROL as i32),
+                    modifier_pressed(VK_SHIFT as i32),
+                ) {
                     continue;
                 }
                 match msg.wParam as u16 {

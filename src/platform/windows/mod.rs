@@ -2,6 +2,7 @@ mod ai_credentials;
 mod ai_window;
 mod clipboard;
 mod date;
+mod http_url;
 mod markdown;
 mod shell;
 mod theme;
@@ -17,7 +18,8 @@ pub(crate) use ai_window::{
 };
 pub(crate) use clipboard::copy_text;
 pub(crate) use date::local_date;
-pub(crate) use shell::{shell_execute, windows_program};
+pub(crate) use http_url::ParsedUrl;
+pub(crate) use shell::{known_folder_path, shell_execute, windows_program};
 pub(crate) use theme::theme;
 pub(crate) use window::activate_window;
 

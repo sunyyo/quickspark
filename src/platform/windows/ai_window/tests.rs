@@ -66,7 +66,7 @@ fn native_answer_controls_follow_reasoning_and_completion() {
             assert_ne!(unsafe { IsWindowVisible(state.thinking_edit) }, 0);
         });
         assert!(super::append_ai_answer(window, "这是一段回答。"));
-        super::finish_ai_answer(window, Some("length"));
+        super::finish_ai_answer(window, super::AiCompletion::LengthLimit);
         inspect(window, |state| {
             assert!(!state.streaming);
             assert_eq!(unsafe { IsWindowVisible(state.stop_button) }, 0);
@@ -218,7 +218,7 @@ fn native_answer_destruction_releases_resources_after_the_last_callback() {
         let closed = cancel + 1;
         let window = super::show_ai_stream(owner, "销毁测试", cancel, closed, 42, true).unwrap();
         let _cleanup = AnswerWindowGuard(window);
-        let shared = unsafe { super::answer_window_state(window) }.unwrap();
+        let shared = super::answer_window_state(window).unwrap();
         let weak = std::rc::Rc::downgrade(&shared);
         drop(shared);
         let resources: [HGDIOBJ; 6] = inspect(window, |state| {
@@ -235,7 +235,7 @@ fn native_answer_destruction_releases_resources_after_the_last_callback() {
             super::with_answer_state(window, |state| {
                 unsafe { SendMessageW(window, WM_CLOSE, 0, 0) };
                 assert_eq!(unsafe { IsWindow(window) }, 0);
-                assert!(unsafe { super::answer_window_state(window) }.is_none());
+                assert!(super::answer_window_state(window).is_none());
                 assert!(weak.upgrade().is_some());
                 RESOURCE_RELEASES.with(|releases| assert!(releases.borrow().is_empty()));
                 for resource in resources {
@@ -297,7 +297,9 @@ struct AnswerWindowGuard(windows_sys::Win32::Foundation::HWND);
 
 impl Drop for AnswerWindowGuard {
     fn drop(&mut self) {
-        super::close_ai_answer(self.0);
+        if unsafe { super::IsWindow(self.0) } != 0 {
+            unsafe { super::DestroyWindow(self.0) };
+        }
     }
 }
 
@@ -306,4 +308,45 @@ fn control_text(window: windows_sys::Win32::Foundation::HWND) -> String {
     let mut text = vec![0u16; length as usize + 1];
     unsafe { super::GetWindowTextW(window, text.as_mut_ptr(), text.len() as i32) };
     String::from_utf16_lossy(&text[..length as usize])
+}
+
+#[test]
+fn cached_answers_keep_their_status_and_multiline_rich_edit_styles() {
+    use super::{AiCompletion, CFE_BOLD, EM_SETSEL, SCF_SELECTION, SendMessageW};
+    const EM_GETCHARFORMAT: u32 = 0x043a;
+    for completion in [
+        AiCompletion::Interrupted,
+        AiCompletion::LengthLimit,
+        AiCompletion::ContentFiltered,
+    ] {
+        let window = super::show_ai_answer(
+            std::ptr::null_mut(),
+            "问题",
+            "😀\nA\n**B**C",
+            "",
+            completion,
+            true,
+        )
+        .unwrap();
+        let _cleanup = AnswerWindowGuard(window);
+        let edit = inspect(window, |state| {
+            assert_eq!(control_text(state.hint), completion.status());
+            assert!(state.rich_edit);
+            state.answer_edit
+        });
+        let bold_at = |position| unsafe {
+            let mut format: CharFormatW = std::mem::zeroed();
+            format.cb_size = std::mem::size_of::<CharFormatW>() as u32;
+            SendMessageW(edit, EM_SETSEL, position, position as isize + 1);
+            SendMessageW(
+                edit,
+                EM_GETCHARFORMAT,
+                SCF_SELECTION,
+                &mut format as *mut CharFormatW as isize,
+            );
+            format.effects & CFE_BOLD != 0
+        };
+        assert!(bold_at(5));
+        assert!(!bold_at(6));
+    }
 }

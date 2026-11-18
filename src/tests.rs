@@ -201,14 +201,20 @@ fn provider_registry_returns_copyable_calculator_result() {
         pinned: &pinned,
         light_theme: false,
     };
-    let results = registry.query(&Query::new("= 12 * (8 + 3)"), &context, 8);
-    assert_eq!(results.len(), 1);
-    assert_eq!(results[0].provider_id, "calculator");
-    assert_eq!(results[0].title, "= 132");
-    assert!(matches!(
-        results[0].primary_action(),
-        Some(Action::CopyText { text }) if text == "132"
-    ));
+    for (input, expected) in [
+        ("= 12 * (8 + 3)", "132"),
+        ("= 100000000000", "100000000000"),
+        ("= 0.1 + 0.2", "0.3"),
+        ("= 1 / 10000000000000", "0.0000000000001"),
+    ] {
+        let results = registry.query(&Query::new(input), &context, 8);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].provider_id, "calculator");
+        assert_eq!(results[0].title, format!("= {expected}"));
+        assert!(
+            matches!(results[0].primary_action(), Some(Action::CopyText { text }) if text == expected)
+        );
+    }
 }
 
 #[test]
@@ -383,10 +389,11 @@ fn blocks_system_settings_and_administration_shortcuts() {
 
 #[test]
 fn maps_alt_number_shortcuts_to_result_positions() {
-    assert_eq!(alt_shortcut_index(WM_SYSKEYDOWN, 0x31), Some(0));
-    assert_eq!(alt_shortcut_index(WM_SYSKEYDOWN, 0x38), Some(7));
-    assert_eq!(alt_shortcut_index(WM_SYSKEYDOWN, 0x39), None);
-    assert_eq!(alt_shortcut_index(WM_KEYDOWN, 0x31), None);
+    assert_eq!(alt_shortcut_index(WM_SYSKEYDOWN, 0x31, true), Some(0));
+    assert_eq!(alt_shortcut_index(WM_SYSKEYDOWN, 0x38, true), Some(7));
+    assert_eq!(alt_shortcut_index(WM_SYSKEYDOWN, 0x39, true), None);
+    assert_eq!(alt_shortcut_index(WM_KEYDOWN, 0x31, true), None);
+    assert_eq!(alt_shortcut_index(WM_SYSKEYDOWN, 0x31, false), None);
 }
 
 #[test]
@@ -482,4 +489,86 @@ fn filters_sdk_noise_paths_and_user_patterns() {
     ));
     assert!(is_user_blocked("Example Helper", &["helper".into()]));
     assert!(!is_user_blocked("Example Player", &["helper".into()]));
+}
+
+#[test]
+fn background_refresh_and_shortcuts_respect_the_current_result_and_window() {
+    use super::*;
+    let control = |class: &str, parent, style| unsafe {
+        CreateWindowExW(
+            0,
+            wide(class).as_ptr(),
+            null(),
+            style,
+            0,
+            0,
+            200,
+            100,
+            parent,
+            null_mut(),
+            GetModuleHandleW(null()),
+            null(),
+        )
+    };
+    let parent = control("STATIC", HWND_MESSAGE, 0);
+    let edit = control("EDIT", parent, WS_CHILD);
+    let list = control("LISTBOX", parent, WS_CHILD);
+    assert!(!parent.is_null() && !edit.is_null() && !list.is_null());
+    let (index_tx, index_rx) = mpsc::channel();
+    let mut providers = ProviderRegistry::new();
+    providers.register(WebSearchProvider);
+    let state = RefCell::new(App {
+        edit,
+        list,
+        results: Vec::new(),
+        providers,
+        font: null_mut(),
+        shortcut_font: null_mut(),
+        background: null_mut(),
+        dpi: 96,
+        light_theme: true,
+        usage: HashMap::new(),
+        pinned: HashSet::new(),
+        settings: Settings::default(),
+        hotkey_registered: false,
+        ai_service: AiService::new(parent as usize, AI_READY),
+        ai_window: null_mut(),
+        ai_generation: 0,
+        indexing: true,
+        index_tx,
+        index_rx,
+    });
+    unsafe {
+        SetWindowLongPtrW(parent, GWLP_USERDATA, &state as *const AppCell as isize);
+        SetWindowTextW(edit, wide("ss sample").as_ptr());
+        refresh_results(parent, None);
+        assert_eq!(SendMessageW(list, LB_GETCOUNT, 0, 0), 3);
+        SendMessageW(list, LB_SETCURSEL, 1, 0);
+        state
+            .borrow()
+            .index_tx
+            .send(Ok(ApplicationProvider::empty()))
+            .unwrap();
+        wnd_proc(parent, INDEX_READY, 0, 0);
+        assert_eq!(selected_result_position(parent), Some(1));
+        assert!(handle_action_shortcut(parent, VK_RETURN, true, false));
+        state.borrow_mut().settings.result_limit = 1;
+        wnd_proc(parent, FILE_SEARCH_READY, 0, 0);
+        assert_eq!(selected_result_position(parent), Some(0));
+        state.borrow_mut().results[0].actions = vec![Action::SystemCommand {
+            command: SystemCommand::Lock,
+        }];
+        assert!(handle_action_shortcut(parent, VK_RETURN, true, false));
+
+        let answer =
+            show_ai_stream(parent, "新请求", AI_CANCEL, AI_WINDOW_CLOSED, 2, true).unwrap();
+        state.borrow_mut().ai_window = answer;
+        state.borrow_mut().ai_generation = 2;
+        wnd_proc(parent, AI_CANCEL, 1, answer as LPARAM);
+        wnd_proc(parent, AI_CANCEL, 2, edit as LPARAM);
+        assert!(append_ai_answer(answer, "新请求仍然有效"));
+        close_ai_answer(answer);
+        SetWindowLongPtrW(parent, GWLP_USERDATA, 0);
+        DestroyWindow(parent);
+    }
 }

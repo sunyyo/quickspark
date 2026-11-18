@@ -50,7 +50,7 @@ pub(super) fn run(
     if !config.is_ready() {
         return Err("请先输入 ai settings，配置完整 API 地址和模型名称".to_owned());
     }
-    let ai_api_key = load_ai_api_key().unwrap_or_default();
+    let ai_api_key = load_ai_api_key(&config.api_url)?.unwrap_or_default();
     let context = transport::RequestContext {
         current_generation: Arc::clone(&service.generation),
         generation,
@@ -104,7 +104,6 @@ fn research(
     service: &AiService,
     started: Instant,
 ) -> Result<(Vec<SearchSource>, Option<String>), String> {
-    let tavily_api_key = load_tavily_api_key().unwrap_or_default();
     let mut sources = Vec::new();
     let mut source_urls = HashSet::new();
     let mut executed_queries = Vec::new();
@@ -130,6 +129,7 @@ fn research(
         WebSearchMode::Disabled => return Ok((sources, warning)),
     };
 
+    let tavily_api_key = load_tavily_api_key()?.unwrap_or_default();
     let mut round = 0usize;
     while !pending.is_empty()
         && round < MAX_SEARCH_ROUNDS
@@ -232,6 +232,14 @@ fn decide(
         remaining_timeout_seconds(planner_config.timeout_seconds.min(30), started)?;
     let response = transport::winhttp_stream_json(&planner_config, api_key, &body, context, |_| {})
         .map_err(|error| format!("联网规划请求失败：{error}"))?;
+    if matches!(
+        response.completion,
+        crate::model::AiCompletion::Interrupted
+            | crate::model::AiCompletion::LengthLimit
+            | crate::model::AiCompletion::ContentFiltered
+    ) {
+        return Err(format!("联网规划未完成：{}", response.completion.status()));
+    }
     parse_agent_decision(&response.answer)
 }
 

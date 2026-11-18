@@ -22,6 +22,36 @@ impl Query {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum AiCompletion {
+    Complete,
+    LengthLimit,
+    ContentFiltered,
+    Interrupted,
+    Other,
+}
+
+impl AiCompletion {
+    pub(crate) fn from_reason(reason: &str) -> Self {
+        match reason {
+            "stop" => Self::Complete,
+            "length" => Self::LengthLimit,
+            "content_filter" => Self::ContentFiltered,
+            _ => Self::Other,
+        }
+    }
+
+    pub(crate) fn status(self) -> &'static str {
+        match self {
+            Self::Complete => "生成完成",
+            Self::LengthLimit => "输出达到长度上限，回答可能不完整",
+            Self::ContentFiltered => "输出因内容过滤而结束",
+            Self::Interrupted => "连接提前结束，仅保留已收到的部分回答",
+            Self::Other => "生成结束（接口返回非标准原因）",
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum AiTask {
     Question,
@@ -100,6 +130,7 @@ pub(crate) enum Action {
         prompt: String,
         answer: String,
         reasoning: String,
+        completion: AiCompletion,
     },
     ConfigureAiKey,
     ConfigureTavilyKey,

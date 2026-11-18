@@ -83,12 +83,24 @@ pub(crate) fn format_number(value: f64) -> String {
     if value == 0.0 {
         return "0".to_owned();
     }
-    let rounded = if value.abs() < 1_000_000_000_000.0 {
-        (value * 1_000_000_000_000.0).round() / 1_000_000_000_000.0
-    } else {
-        value
+    let shortest = value.to_string();
+    let Some((_, fraction)) = shortest.split_once('.') else {
+        return shortest;
     };
-    rounded.to_string()
+    // Keep small nonzero values meaningful while trimming arithmetic noise.
+    let leading_zeros = if value.abs() < 1.0 {
+        fraction.bytes().take_while(|digit| *digit == b'0').count()
+    } else {
+        0
+    };
+    let precision = 12 + leading_zeros;
+    if fraction.len() <= precision {
+        return shortest;
+    }
+    format!("{value:.precision$}")
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_owned()
 }
 
 struct Parser<'a> {
@@ -245,6 +257,8 @@ mod tests {
         assert_eq!(format_number(evaluate("0.1 + 0.2").unwrap()), "0.3");
         assert_eq!(format_number(evaluate("10 / 4").unwrap()), "2.5");
         assert_eq!(format_number(-0.0), "0");
+        assert_eq!(format_number(100_000_000_000.0), "100000000000");
+        assert_eq!(format_number(1.25e-14), "0.0000000000000125");
     }
 
     #[test]

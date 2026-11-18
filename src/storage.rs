@@ -1,7 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
     env, fs,
-    net::IpAddr,
     path::{Path, PathBuf},
 };
 
@@ -14,7 +13,10 @@ use windows_sys::Win32::{
     },
 };
 
-use crate::{model::Usage, platform::windows::wide};
+use crate::{
+    model::Usage,
+    platform::windows::{ParsedUrl, wide},
+};
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "QuickSpark";
@@ -197,31 +199,8 @@ impl Default for AiConfig {
 
 impl AiConfig {
     pub(crate) fn is_ready(&self) -> bool {
-        let url = self.api_url.trim();
-        !self.model.trim().is_empty() && is_allowed_ai_url(url)
+        !self.model.trim().is_empty() && ParsedUrl::parse(&self.api_url).is_ok()
     }
-}
-
-fn is_allowed_ai_url(url: &str) -> bool {
-    if url.starts_with("https://") {
-        return true;
-    }
-    let Some(authority) = url
-        .strip_prefix("http://")
-        .and_then(|rest| rest.split(['/', '?', '#']).next())
-        .filter(|authority| !authority.is_empty() && !authority.contains('@'))
-    else {
-        return false;
-    };
-    let host = if let Some(ipv6) = authority.strip_prefix('[') {
-        ipv6.split_once(']').map(|(host, _)| host).unwrap_or("")
-    } else {
-        authority.split(':').next().unwrap_or("")
-    };
-    host.trim_end_matches('.').eq_ignore_ascii_case("localhost")
-        || host
-            .parse::<IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
 }
 
 impl Default for Settings {
@@ -591,40 +570,41 @@ reasoning_effort=high\n";
 }
 
 fn ensure_ai_thinking_settings(path: &Path) {
-    let Ok(mut text) = fs::read_to_string(path) else {
+    let Ok(original) = fs::read_to_string(path) else {
         return;
     };
-    let legacy_prompt = format!("system_prompt={LEGACY_SYSTEM_PROMPT}");
-    let current_prompt = format!("system_prompt={DEFAULT_SYSTEM_PROMPT}");
-    let upgraded_prompt = text.contains(&legacy_prompt);
-    if upgraded_prompt {
-        text = text.replace(&legacy_prompt, &current_prompt);
+    let mut text = String::with_capacity(original.len());
+    let mut has_thinking_mode = false;
+    let mut has_reasoning_effort = false;
+    for line in original.split_inclusive('\n') {
+        if let Some((key, value)) = line.split_once('=') {
+            match key.trim() {
+                "system_prompt" if value.trim() == LEGACY_SYSTEM_PROMPT => {
+                    text.push_str(&line.replacen(LEGACY_SYSTEM_PROMPT, DEFAULT_SYSTEM_PROMPT, 1));
+                    continue;
+                }
+                "thinking_mode" => has_thinking_mode = true,
+                "reasoning_effort" => has_reasoning_effort = true,
+                _ => {}
+            }
+        }
+        text.push_str(line);
     }
-    let has_key = |expected: &str| {
-        text.lines().any(|line| {
-            let line = line.trim();
-            !line.starts_with('#')
-                && line
-                    .split_once('=')
-                    .is_some_and(|(key, _)| key.trim() == expected)
-        })
-    };
-    let has_thinking_mode = has_key("thinking_mode");
-    let has_reasoning_effort = has_key("reasoning_effort");
-    if has_thinking_mode && has_reasoning_effort && !upgraded_prompt {
-        return;
+    if !has_thinking_mode || !has_reasoning_effort {
+        if !text.ends_with('\n') {
+            text.push('\n');
+        }
+        text.push_str("# DeepSeek V4 思考模式：auto / enabled / disabled；强度：high / max\n");
     }
-    if !text.ends_with('\n') {
-        text.push('\n');
-    }
-    text.push_str("# DeepSeek V4 思考模式：auto / enabled / disabled；强度：high / max\n");
     if !has_thinking_mode {
         text.push_str("thinking_mode=auto\n");
     }
     if !has_reasoning_effort {
         text.push_str("reasoning_effort=high\n");
     }
-    let _ = write_atomic(path, &text);
+    if text != original {
+        let _ = write_atomic(path, &text);
+    }
 }
 
 pub(crate) fn load_ai_config() -> AiConfig {
@@ -707,6 +687,29 @@ mod tests {
     };
 
     use super::{AiConfig, LEGACY_MIGRATION_MARKER, migrate_legacy_data_dirs};
+
+    #[test]
+    fn migration_only_replaces_the_complete_active_default_prompt() {
+        use super::{DEFAULT_SYSTEM_PROMPT, LEGACY_SYSTEM_PROMPT, ensure_ai_thinking_settings};
+        let path =
+            std::env::temp_dir().join(format!("quickspark-prompt-{}.txt", std::process::id()));
+        let customized = format!(
+            "# system_prompt={LEGACY_SYSTEM_PROMPT}\r\nother=system_prompt={LEGACY_SYSTEM_PROMPT}\r\nsystem_prompt={LEGACY_SYSTEM_PROMPT}只用法语。\r\n"
+        );
+        let settings = "thinking_mode=auto\r\nreasoning_effort=high";
+        let original = format!("{customized}{settings}");
+        fs::write(&path, &original).unwrap();
+        ensure_ai_thinking_settings(&path);
+        assert_eq!(fs::read_to_string(&path).unwrap(), original);
+        let old = format!("{customized}  system_prompt = {LEGACY_SYSTEM_PROMPT}  \r\n{settings}");
+        let expected =
+            format!("{customized}  system_prompt = {DEFAULT_SYSTEM_PROMPT}  \r\n{settings}");
+        fs::write(&path, old).unwrap();
+        ensure_ai_thinking_settings(&path);
+        ensure_ai_thinking_settings(&path);
+        assert_eq!(fs::read_to_string(&path).unwrap(), expected);
+        fs::remove_file(path).unwrap();
+    }
 
     #[test]
     fn requires_http_url_and_model() {

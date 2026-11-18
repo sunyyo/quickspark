@@ -10,11 +10,12 @@ use super::{
     AiResponse, AiState, StreamDelta, ai_query, finish_event_if_current, lock_state, preview,
     question_request, request_cache_key, translation_query, translation_request,
     transport::{
-        ParsedUrl, RequestContext, SseDecoder, StreamFrame, agent_request_body, extract_response,
+        RequestContext, SseDecoder, StreamFrame, agent_request_body, extract_response,
         request_body, winhttp_json, winhttp_stream_json,
     },
 };
-use crate::model::WebSearchMode;
+use crate::model::{AiCompletion, WebSearchMode};
+use crate::platform::windows::ParsedUrl;
 use crate::storage::{AiConfig, ReasoningEffort, ThinkingMode};
 
 fn read_http_request(stream: &mut impl Read) -> Vec<u8> {
@@ -190,7 +191,7 @@ fn extracts_string_and_structured_answers_and_api_errors() {
         super::AiResponse {
             answer: "回答".to_owned(),
             reasoning: "思考".to_owned(),
-            finish_reason: Some("length".to_owned()),
+            completion: AiCompletion::LengthLimit,
         }
     );
     assert_eq!(
@@ -199,7 +200,7 @@ fn extracts_string_and_structured_answers_and_api_errors() {
         super::AiResponse {
             answer: "AB".to_owned(),
             reasoning: String::new(),
-            finish_reason: None,
+            completion: AiCompletion::Complete,
         }
     );
     assert_eq!(
@@ -257,7 +258,7 @@ fn stale_completion_cannot_overwrite_a_newer_loading_request() {
         Ok(AiResponse {
             answer: "迟到的回答".to_owned(),
             reasoning: String::new(),
-            finish_reason: Some("stop".to_owned()),
+            completion: AiCompletion::Complete,
         }),
     );
 
@@ -279,7 +280,7 @@ fn terminal_events_keep_full_results_in_the_service_cache() {
     let response = AiResponse {
         answer: "完整回答".repeat(10_000),
         reasoning: "完整思考".repeat(10_000),
-        finish_reason: Some("length".to_owned()),
+        completion: AiCompletion::LengthLimit,
     };
     for result in [Ok(response.clone()), Err("连接中断".to_owned())] {
         let state = Mutex::new(AiState::Loading {
@@ -293,10 +294,10 @@ fn terminal_events_keep_full_results_in_the_service_cache() {
             (
                 super::AiEvent::Finished {
                     generation: 7,
-                    finish_reason,
+                    completion,
                 },
                 Ok(response),
-            ) => assert_eq!(finish_reason, &response.finish_reason),
+            ) => assert_eq!(completion, &response.completion),
             (
                 super::AiEvent::Failed {
                     generation: 7,
@@ -319,12 +320,12 @@ fn answer_actions_preserve_borrowed_full_text_and_regeneration_request() {
     let response = AiResponse {
         answer: "Hello. ".repeat(10_000),
         reasoning: "翻译依据".repeat(10_000),
-        finish_reason: Some("stop".to_owned()),
+        completion: AiCompletion::Complete,
     };
     let result = super::answer_result(&request, &response);
     assert!(
-        matches!(&result.actions[0], crate::model::Action::ShowAiAnswer { prompt, answer, reasoning }
-        if prompt == &request.display_prompt && answer == &response.answer && reasoning == &response.reasoning)
+        matches!(&result.actions[0], crate::model::Action::ShowAiAnswer { prompt, answer, reasoning, completion }
+        if *completion == response.completion && prompt == &request.display_prompt && answer == &response.answer && reasoning == &response.reasoning)
     );
     assert!(
         matches!(&result.actions[1], crate::model::Action::CopyText { text } if text == &response.answer)
@@ -362,70 +363,86 @@ fn decodes_sse_across_arbitrary_network_chunks() {
 
 #[test]
 fn posts_to_a_local_openai_compatible_endpoint() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
-        let request = read_http_request(&mut stream);
-        let request = String::from_utf8_lossy(&request);
-        assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
-        assert!(request.contains(concat!(
-            "User-Agent: QuickSpark/",
-            env!("CARGO_PKG_VERSION")
-        )));
-        assert!(
-            request
-                .to_ascii_lowercase()
-                .contains("authorization: bearer test-key")
-        );
-        let body = concat!(
-            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"分析\"}}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"本地\"}}]}\n\n",
-            "data: {\"choices\":[{\"delta\":{\"content\":\"测试成功\"}}]}\n\n",
-            "data: [DONE]\n\n"
-        );
-        write!(
-            stream,
-            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            body.len(),
-            body
+    for (ending, expected) in [
+        ("data: [DONE]\n\n", AiCompletion::Complete),
+        ("data: [DONE]", AiCompletion::Complete),
+        (
+            "data: {\"choices\":[{\"finish_reason\":\"length\"}]}\n\n",
+            AiCompletion::LengthLimit,
+        ),
+        ("", AiCompletion::Interrupted),
+    ] {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            let request = read_http_request(&mut stream);
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
+            assert!(request.contains(concat!(
+                "User-Agent: QuickSpark/",
+                env!("CARGO_PKG_VERSION")
+            )));
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains("authorization: bearer test-key")
+            );
+            let deltas = concat!(
+                "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"分析\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"本地\"}}]}\n\n",
+                "data: {\"choices\":[{\"delta\":{\"content\":\"测试成功\"}}]}\n\n",
+            );
+            let body = format!("{deltas}{ending}");
+            let size = body.len();
+            write!(
+                stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {size}\r\nConnection: close\r\n\r\n{body}"
+            ).unwrap();
+            stream.flush().unwrap();
+        });
+        let config = AiConfig {
+            api_url: format!("http://{address}/v1/chat/completions"),
+            model: "local-test".to_owned(),
+            system_prompt: String::new(),
+            max_tokens: 32,
+            timeout_seconds: 5,
+            ..AiConfig::default()
+        };
+        let request = request_body(&config, &question_request("测试"));
+        let mut deltas = Vec::new();
+        let answer = winhttp_stream_json(
+            &config,
+            "test-key",
+            &request,
+            RequestContext::standalone(),
+            |delta| deltas.push(delta),
         )
         .unwrap();
-        stream.flush().unwrap();
-    });
-    let config = AiConfig {
-        api_url: format!("http://{address}/v1/chat/completions"),
-        model: "local-test".to_owned(),
-        system_prompt: String::new(),
-        max_tokens: 32,
-        timeout_seconds: 5,
-        ..AiConfig::default()
-    };
-    let request = request_body(&config, &question_request("测试"));
-    let mut deltas = Vec::new();
-    let answer = winhttp_stream_json(
-        &config,
-        "test-key",
-        &request,
-        RequestContext::standalone(),
-        |delta| deltas.push(delta),
-    )
-    .unwrap();
-    assert_eq!(answer.answer, "本地测试成功");
-    assert_eq!(answer.reasoning, "分析");
-    assert_eq!(answer.finish_reason, None);
-    assert_eq!(
-        deltas,
-        [
-            StreamDelta::Reasoning("分析".to_owned()),
-            StreamDelta::Answer("本地".to_owned()),
-            StreamDelta::Answer("测试成功".to_owned()),
-        ]
-    );
-    server.join().unwrap();
+        assert_eq!(answer.answer, "本地测试成功");
+        assert_eq!(answer.reasoning, "分析");
+        assert_eq!(answer.completion, expected);
+        let cached = super::answer_result(&question_request("测试"), &answer);
+        assert!(
+            matches!(&cached.actions[0], crate::model::Action::ShowAiAnswer { answer, completion, .. }
+        if answer == "本地测试成功" && *completion == expected)
+        );
+        assert!(
+            matches!(&cached.actions[1], crate::model::Action::CopyText { text } if text == "本地测试成功")
+        );
+        assert_eq!(
+            deltas,
+            [
+                StreamDelta::Reasoning("分析".to_owned()),
+                StreamDelta::Answer("本地".to_owned()),
+                StreamDelta::Answer("测试成功".to_owned()),
+            ]
+        );
+        server.join().unwrap();
+    }
 }
 
 #[test]

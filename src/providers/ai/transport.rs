@@ -1,6 +1,6 @@
 use std::{
     ffi::c_void,
-    net::IpAddr,
+    ops::ControlFlow,
     ptr::{null, null_mut},
     sync::{
         Arc,
@@ -10,17 +10,16 @@ use std::{
 
 use serde_json::{Value, json};
 use windows_sys::Win32::Networking::WinHttp::{
-    URL_COMPONENTS, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_DISABLE_REDIRECTS,
-    WINHTTP_FLAG_SECURE, WINHTTP_INTERNET_SCHEME_HTTP, WINHTTP_INTERNET_SCHEME_HTTPS,
+    WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_DISABLE_REDIRECTS, WINHTTP_FLAG_SECURE,
     WINHTTP_OPTION_DISABLE_FEATURE, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
-    WinHttpCloseHandle, WinHttpConnect, WinHttpCrackUrl, WinHttpOpen, WinHttpOpenRequest,
-    WinHttpQueryDataAvailable, WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse,
-    WinHttpSendRequest, WinHttpSetOption, WinHttpSetTimeouts,
+    WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryDataAvailable,
+    WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest,
+    WinHttpSetOption, WinHttpSetTimeouts,
 };
 
 use crate::{
-    model::{AiRequest, AiTask},
-    platform::windows::wide,
+    model::{AiCompletion, AiRequest, AiTask},
+    platform::windows::{ParsedUrl, wide},
     storage::{AiConfig, ThinkingMode},
 };
 
@@ -127,10 +126,10 @@ pub(super) fn extract_response(bytes: &[u8]) -> Result<AiResponse, String> {
         Ok(AiResponse {
             answer: answer.to_owned(),
             reasoning,
-            finish_reason: choice
+            completion: choice
                 .get("finish_reason")
                 .and_then(Value::as_str)
-                .map(str::to_owned),
+                .map_or(AiCompletion::Complete, AiCompletion::from_reason),
         })
     }
 }
@@ -171,6 +170,24 @@ where
     let mut reasoning = String::new();
     let mut finish_reason = None;
     let mut saw_sse = false;
+    let mut accept = |frames: Vec<StreamFrame>| {
+        for frame in frames {
+            saw_sse = true;
+            match frame {
+                StreamFrame::Reasoning(text) => {
+                    reasoning.push_str(&text);
+                    on_delta(StreamDelta::Reasoning(text));
+                }
+                StreamFrame::Answer(text) => {
+                    answer.push_str(&text);
+                    on_delta(StreamDelta::Answer(text));
+                }
+                StreamFrame::FinishReason(reason) => finish_reason = Some(reason),
+                StreamFrame::Done => return ControlFlow::Break(()),
+            }
+        }
+        ControlFlow::Continue(())
+    };
     let mut done = false;
     read_response_chunks(request.handle.0, |chunk| {
         context.ensure_current()?;
@@ -182,40 +199,11 @@ where
             return Err("AI 响应超过 4 MB 安全上限".to_owned());
         }
         raw_response.extend_from_slice(chunk);
-        for frame in decoder.push(chunk)? {
-            saw_sse = true;
-            match frame {
-                StreamFrame::Reasoning(text) => {
-                    reasoning.push_str(&text);
-                    on_delta(StreamDelta::Reasoning(text));
-                }
-                StreamFrame::Answer(text) => {
-                    answer.push_str(&text);
-                    on_delta(StreamDelta::Answer(text));
-                }
-                StreamFrame::FinishReason(reason) => finish_reason = Some(reason),
-                StreamFrame::Done => done = true,
-            }
-        }
-        Ok(())
+        let flow = accept(decoder.push(chunk)?);
+        done = flow.is_break();
+        Ok(flow)
     })?;
-    if !done {
-        for frame in decoder.finish()? {
-            saw_sse = true;
-            match frame {
-                StreamFrame::Reasoning(text) => {
-                    reasoning.push_str(&text);
-                    on_delta(StreamDelta::Reasoning(text));
-                }
-                StreamFrame::Answer(text) => {
-                    answer.push_str(&text);
-                    on_delta(StreamDelta::Answer(text));
-                }
-                StreamFrame::FinishReason(reason) => finish_reason = Some(reason),
-                StreamFrame::Done => {}
-            }
-        }
-    }
+    let done = done || accept(decoder.finish()?).is_break();
     if saw_sse {
         let answer = answer.trim();
         if answer.is_empty() {
@@ -224,7 +212,14 @@ where
             Ok(AiResponse {
                 answer: answer.to_owned(),
                 reasoning,
-                finish_reason,
+                completion: finish_reason
+                    .as_deref()
+                    .map(AiCompletion::from_reason)
+                    .unwrap_or(if done {
+                        AiCompletion::Complete
+                    } else {
+                        AiCompletion::Interrupted
+                    }),
             })
         }
     } else {
@@ -266,7 +261,7 @@ pub(super) fn winhttp_json(
             return Err(format!("{service_name} 响应超过 4 MB 安全上限"));
         }
         response.extend_from_slice(chunk);
-        Ok(())
+        Ok(ControlFlow::Continue(()))
     })?;
     if !(200..300).contains(&status) {
         let details = api_error_message(&response);
@@ -414,14 +409,14 @@ fn read_response(request: *mut c_void) -> Result<Vec<u8>, String> {
             return Err("AI 响应超过 4 MB 安全上限".to_owned());
         }
         response.extend_from_slice(chunk);
-        Ok(())
+        Ok(ControlFlow::Continue(()))
     })?;
     Ok(response)
 }
 
 fn read_response_chunks<F>(request: *mut c_void, mut on_chunk: F) -> Result<(), String>
 where
-    F: FnMut(&[u8]) -> Result<(), String>,
+    F: FnMut(&[u8]) -> Result<ControlFlow<()>, String>,
 {
     loop {
         let mut available = 0u32;
@@ -442,7 +437,9 @@ where
         if read == 0 {
             break;
         }
-        on_chunk(&chunk[..read as usize])?;
+        if on_chunk(&chunk[..read as usize])?.is_break() {
+            break;
+        }
     }
     Ok(())
 }
@@ -598,77 +595,6 @@ fn trim_ascii(mut value: &[u8]) -> &[u8] {
         value = &value[..value.len() - 1];
     }
     value
-}
-
-pub(super) struct ParsedUrl {
-    pub(super) host: String,
-    pub(super) object: String,
-    pub(super) port: u16,
-    secure: bool,
-}
-
-impl ParsedUrl {
-    pub(super) fn parse(url: &str) -> Result<Self, String> {
-        let wide_url = wide(url.trim());
-        let mut components = URL_COMPONENTS {
-            dwStructSize: std::mem::size_of::<URL_COMPONENTS>() as u32,
-            dwSchemeLength: u32::MAX,
-            dwHostNameLength: u32::MAX,
-            dwUrlPathLength: u32::MAX,
-            dwExtraInfoLength: u32::MAX,
-            ..Default::default()
-        };
-        if unsafe { WinHttpCrackUrl(wide_url.as_ptr(), 0, 0, &mut components) } == 0 {
-            return Err(last_error("AI API 地址无效"));
-        }
-        let secure = match components.nScheme {
-            WINHTTP_INTERNET_SCHEME_HTTPS => true,
-            WINHTTP_INTERNET_SCHEME_HTTP => false,
-            _ => return Err("AI API 地址只支持 http:// 或 https://".to_owned()),
-        };
-        let host = unsafe { wide_slice(components.lpszHostName, components.dwHostNameLength) };
-        if host.is_empty() {
-            return Err("AI API 地址缺少主机名".to_owned());
-        }
-        if !secure && !is_loopback_host(&host) {
-            return Err(
-                "为防止 API Key 和问题内容被明文传输，远程 AI 接口必须使用 https://；http:// 仅允许本机地址"
-                    .to_owned(),
-            );
-        }
-        let mut object = unsafe { wide_slice(components.lpszUrlPath, components.dwUrlPathLength) };
-        object.push_str(&unsafe {
-            wide_slice(components.lpszExtraInfo, components.dwExtraInfoLength)
-        });
-        if object.is_empty() {
-            object.push('/');
-        }
-        Ok(Self {
-            host,
-            object,
-            port: components.nPort,
-            secure,
-        })
-    }
-}
-
-fn is_loopback_host(host: &str) -> bool {
-    let normalized = host
-        .trim()
-        .trim_start_matches('[')
-        .trim_end_matches(']')
-        .trim_end_matches('.');
-    normalized.eq_ignore_ascii_case("localhost")
-        || normalized
-            .parse::<IpAddr>()
-            .is_ok_and(|address| address.is_loopback())
-}
-
-unsafe fn wide_slice(pointer: *mut u16, length: u32) -> String {
-    if pointer.is_null() || length == 0 || length == u32::MAX {
-        return String::new();
-    }
-    String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(pointer, length as usize) })
 }
 
 struct InternetHandle(*mut c_void);

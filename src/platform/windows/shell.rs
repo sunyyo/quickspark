@@ -1,8 +1,19 @@
-use std::{env, path::PathBuf, ptr::null};
+use std::{
+    env,
+    ffi::OsString,
+    os::windows::ffi::OsStringExt,
+    path::PathBuf,
+    ptr::{null, null_mut},
+};
 
 use windows_sys::Win32::{
     Foundation::HWND,
-    UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNORMAL},
+    Globalization::lstrlenW,
+    System::Com::CoTaskMemFree,
+    UI::{
+        Shell::{SHGetKnownFolderPath, ShellExecuteW},
+        WindowsAndMessaging::SW_SHOWNORMAL,
+    },
 };
 
 use super::wide;
@@ -28,6 +39,17 @@ pub(crate) unsafe fn shell_execute(
         ) as isize
             > 32
     }
+}
+
+pub(crate) fn known_folder_path(id: &windows_sys::core::GUID) -> Option<PathBuf> {
+    let mut path = null_mut();
+    let status = unsafe { SHGetKnownFolderPath(id, 0, null_mut(), &mut path) };
+    let result = (status >= 0 && !path.is_null()).then(|| unsafe {
+        let units = std::slice::from_raw_parts(path, lstrlenW(path) as usize);
+        PathBuf::from(OsString::from_wide(units))
+    });
+    unsafe { CoTaskMemFree(path.cast()) };
+    result
 }
 
 pub(crate) fn windows_program(relative: &str) -> Option<String> {

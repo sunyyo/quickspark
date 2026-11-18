@@ -1,6 +1,7 @@
 use std::{
     borrow::Cow,
     cell::RefCell,
+    collections::HashMap,
     ptr::{null, null_mut},
     rc::Rc,
     sync::OnceLock,
@@ -17,10 +18,7 @@ use windows_sys::Win32::{
         HBRUSH, HDC, HFONT, InvalidateRect, OUT_DEFAULT_PRECIS, PS_SOLID, RoundRect, SelectObject,
         SetBkColor, SetBkMode, SetTextColor, TRANSPARENT, UpdateWindow,
     },
-    System::{
-        LibraryLoader::{GetModuleHandleW, LoadLibraryW},
-        Threading::GetCurrentThreadId,
-    },
+    System::LibraryLoader::{GetModuleHandleW, LoadLibraryW},
     UI::{
         Controls::{DRAWITEMSTRUCT, ODS_DISABLED, ODS_FOCUS, ODS_SELECTED, SetWindowTheme},
         HiDpi::GetDpiForWindow,
@@ -32,14 +30,13 @@ use windows_sys::Win32::{
         WindowsAndMessaging::{
             BM_CLICK, BS_OWNERDRAW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CreateWindowExW,
             DefWindowProcW, DestroyWindow, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY,
-            GetClientRect, GetNextDlgTabItem, GetWindowLongPtrW, GetWindowRect,
-            GetWindowTextLengthW, GetWindowTextW, GetWindowThreadProcessId, IDC_ARROW, IsWindow,
-            KillTimer, LoadCursorW, MB_ICONERROR, MB_OK, MINMAXINFO, MessageBoxW, MoveWindow,
-            PostMessageW, RegisterClassW, SW_HIDE, SW_SHOW, SendMessageW, SetForegroundWindow,
-            SetTimer, SetWindowLongPtrW, SetWindowTextW, ShowWindow, WM_CLOSE, WM_COMMAND, WM_COPY,
-            WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DRAWITEM,
-            WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_NCDESTROY, WM_SETFOCUS, WM_SETFONT,
-            WM_SETREDRAW, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CHILD, WS_EX_TOOLWINDOW,
+            GetClientRect, GetNextDlgTabItem, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+            IDC_ARROW, IsWindow, KillTimer, LoadCursorW, MB_ICONERROR, MB_OK, MINMAXINFO,
+            MessageBoxW, MoveWindow, PostMessageW, RegisterClassW, SW_HIDE, SW_SHOW, SendMessageW,
+            SetForegroundWindow, SetTimer, SetWindowTextW, ShowWindow, WM_CLOSE, WM_COMMAND,
+            WM_COPY, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY,
+            WM_DRAWITEM, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_NCDESTROY, WM_SETFOCUS,
+            WM_SETFONT, WM_SETREDRAW, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CHILD, WS_EX_TOOLWINDOW,
             WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
         },
     },
@@ -49,6 +46,7 @@ use super::clipboard::copy_text;
 use super::markdown::{MarkdownSpan, MarkdownStyle, render_markdown};
 use super::theme::{Theme as AnswerColors, theme as answer_colors};
 use super::wide;
+use crate::model::AiCompletion;
 
 mod rendering;
 
@@ -107,6 +105,7 @@ struct CharFormatW {
 }
 
 struct AnswerInit {
+    initial_status: &'static str,
     prompt: String,
     answer: String,
     reasoning: String,
@@ -225,30 +224,23 @@ impl Drop for AnswerWindowState {
     }
 }
 
-unsafe fn answer_window_state(window: HWND) -> Option<Rc<AnswerWindowState>> {
-    if unsafe { GetWindowThreadProcessId(window, null_mut()) != GetCurrentThreadId() } {
-        return None;
-    }
-    let pointer = unsafe { GetWindowLongPtrW(window, 0) } as *const AnswerWindowState;
-    if pointer.is_null() {
-        return None;
-    }
-    // Access is confined to the owning UI thread. Each callback retains an
-    // owner so synchronous window destruction cannot free its active borrow.
-    unsafe {
-        Rc::increment_strong_count(pointer);
-        Some(Rc::from_raw(pointer))
-    }
+// Each callback holds an Rc while Win32 can synchronously re-enter or destroy a window.
+thread_local! {
+    static ANSWER_WINDOWS: RefCell<HashMap<HWND, Rc<AnswerWindowState>>> = RefCell::new(HashMap::new());
+}
+
+fn answer_window_state(window: HWND) -> Option<Rc<AnswerWindowState>> {
+    ANSWER_WINDOWS.with_borrow(|windows| windows.get(&window).cloned())
 }
 
 fn with_answer_state<R>(window: HWND, access: impl FnOnce(&mut AnswerWindow) -> R) -> Option<R> {
-    let state = unsafe { answer_window_state(window) }?;
+    let state = answer_window_state(window)?;
     let mut model = state.model.try_borrow_mut().ok()?;
     Some(access(&mut model))
 }
 
 fn with_answer_paint<R>(window: HWND, access: impl FnOnce(&AnswerPaint) -> R) -> Option<R> {
-    let state = unsafe { answer_window_state(window) }?;
+    let state = answer_window_state(window)?;
     Some(access(&state.paint))
 }
 
@@ -257,8 +249,9 @@ pub(crate) fn show_ai_answer(
     prompt: &str,
     answer: &str,
     reasoning: &str,
+    completion: AiCompletion,
     light_theme: bool,
-) -> bool {
+) -> Option<HWND> {
     show_answer_window(AnswerInit {
         prompt: normalize_newlines(prompt),
         answer: normalize_newlines(answer),
@@ -268,9 +261,13 @@ pub(crate) fn show_ai_answer(
         closed_message: 0,
         generation: 0,
         streaming: false,
+        initial_status: if completion == AiCompletion::Complete {
+            "生成完成 · Ctrl+A 全选 · Ctrl+C 复制"
+        } else {
+            completion.status()
+        },
         light_theme,
     })
-    .is_some()
 }
 
 pub(crate) fn show_ai_stream(
@@ -290,6 +287,7 @@ pub(crate) fn show_ai_stream(
         closed_message,
         generation,
         streaming: true,
+        initial_status: "正在连接 AI 接口…",
         light_theme,
     })
 }
@@ -399,14 +397,8 @@ pub(crate) fn append_ai_answer(window: HWND, text: &str) -> bool {
     .unwrap_or(false)
 }
 
-pub(crate) fn finish_ai_answer(window: HWND, finish_reason: Option<&str>) {
-    let status = match finish_reason {
-        Some("length") => "输出达到长度上限，回答可能不完整",
-        Some("content_filter") => "输出因内容过滤而结束",
-        Some(reason) if reason != "stop" => "生成结束（接口返回非标准原因）",
-        _ => "生成完成",
-    };
-    unsafe { set_stream_state(window, status) };
+pub(crate) fn finish_ai_answer(window: HWND, completion: AiCompletion) {
+    unsafe { set_stream_state(window, completion.status()) };
 }
 
 pub(crate) fn fail_ai_answer(window: HWND, error: &str) {
@@ -430,7 +422,7 @@ pub(crate) fn cancel_ai_answer(window: HWND) {
 }
 
 pub(crate) fn close_ai_answer(window: HWND) {
-    if !window.is_null() && unsafe { IsWindow(window) } != 0 {
+    if answer_window_state(window).is_some() {
         unsafe { DestroyWindow(window) };
     }
 }
@@ -441,7 +433,6 @@ fn register_window_class() -> bool {
     let class = WNDCLASSW {
         style: CS_HREDRAW | CS_VREDRAW,
         lpfnWndProc: Some(answer_window_proc),
-        cbWndExtra: std::mem::size_of::<isize>() as i32,
         hInstance: instance,
         hCursor: unsafe { LoadCursorW(null_mut(), IDC_ARROW) },
         hbrBackground: null_mut(),
@@ -575,14 +566,8 @@ unsafe extern "system" fn answer_window_proc(
             0
         }
         WM_NCDESTROY => {
-            let pointer = unsafe { GetWindowLongPtrW(window, 0) } as *const AnswerWindowState;
-            if !pointer.is_null() {
-                // Re-entrant callbacks must stop finding this window's owner.
-                unsafe {
-                    SetWindowLongPtrW(window, 0, 0);
-                    drop(Rc::from_raw(pointer));
-                }
-            }
+            let owner = ANSWER_WINDOWS.with_borrow_mut(|windows| windows.remove(&window));
+            drop(owner);
             0
         }
         _ => unsafe { DefWindowProcW(window, message, wparam, lparam) },
@@ -646,12 +631,7 @@ unsafe fn create_answer_window(window: HWND, lparam: LPARAM) -> LRESULT {
         unsafe { create_button(window, "思考过程 · 等待模型输出", THINK_TOGGLE_ID) };
     let thinking_copy = unsafe { create_button(window, "复制思考", COPY_THINKING_ID) };
     let (thinking_edit, thinking_rich_edit) = unsafe { create_answer_edit(window) };
-    let hint_text = if init.streaming {
-        "正在连接 AI 接口…"
-    } else {
-        "生成完成 · Ctrl+A 全选 · Ctrl+C 复制"
-    };
-    let hint = unsafe { create_static(window, hint_text) };
+    let hint = unsafe { create_static(window, init.initial_status) };
     let copy_button = unsafe { create_button(window, "复制回答", COPY_BUTTON_ID) };
     let stop_button = unsafe { create_button(window, "停止生成", STOP_BUTTON_ID) };
     let close_button = unsafe { create_button(window, "关闭", CLOSE_BUTTON_ID) };
@@ -755,7 +735,7 @@ unsafe fn create_answer_window(window: HWND, lparam: LPARAM) -> LRESULT {
         paint,
         window,
     });
-    unsafe { SetWindowLongPtrW(window, 0, Rc::into_raw(owner) as isize) };
+    ANSWER_WINDOWS.with_borrow_mut(|windows| windows.insert(window, owner));
     with_answer_state(window, |state| unsafe {
         for control in [state.question_label, state.answer_label] {
             SendMessageW(control, WM_SETFONT, state.heading_font as WPARAM, 1);
@@ -1032,35 +1012,23 @@ unsafe fn layout(window: HWND, state: &AnswerWindow) {
 }
 
 unsafe fn notify_cancel(window: HWND) {
-    with_answer_state(window, |state| {
-        if !state.streaming {
-            return;
+    let notification = with_answer_state(window, |state| {
+        state
+            .streaming
+            .then_some((state.owner, state.cancel_message, state.generation))
+    })
+    .flatten();
+    if let Some((owner, message, generation)) = notification {
+        cancel_ai_answer(window);
+        if !owner.is_null() && message != 0 {
+            unsafe { PostMessageW(owner, message, generation as WPARAM, window as LPARAM) };
         }
-        unsafe { complete_thinking(window, state) };
-        state.streaming = false;
-        state.render_dirty = true;
-        unsafe { flush_render(window, state) };
-        unsafe {
-            if GetFocus() == state.stop_button {
-                SetFocus(state.answer_edit);
-            }
-            EnableWindow(state.stop_button, 0);
-            ShowWindow(state.stop_button, SW_HIDE);
-            SetWindowTextW(state.hint, wide("正在停止生成…").as_ptr());
-            layout(window, state);
-            PostMessageW(
-                state.owner,
-                state.cancel_message,
-                state.generation as WPARAM,
-                window as LPARAM,
-            );
-        }
-    });
+    }
 }
 
 unsafe fn set_stream_state(window: HWND, status: &str) {
     with_answer_state(window, |state| {
-        if window.is_null() || unsafe { IsWindow(window) } == 0 {
+        if !state.streaming {
             return;
         }
 

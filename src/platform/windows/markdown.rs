@@ -39,7 +39,9 @@ impl Builder {
     }
 
     fn line_break(&mut self) {
-        self.push("\r\n");
+        // The plain EDIT needs CRLF. Rich Edit indexes that paragraph break as one unit.
+        self.rendered.text.push_str("\r\n");
+        self.utf16_len += 1;
     }
 
     fn span(&mut self, start: usize, style: MarkdownStyle) {

@@ -8,8 +8,16 @@ use std::{
     time::{Duration, Instant},
 };
 
+use windows_sys::{
+    Win32::UI::Shell::{
+        FOLDERID_CommonPrograms, FOLDERID_Desktop, FOLDERID_Programs, FOLDERID_PublicDesktop,
+    },
+    core::GUID,
+};
+
 use crate::{
     model::{Action, Query, ResultItem},
+    platform::windows::known_folder_path,
     search::{rank_entry, search_keys},
     storage::{load_allowed, load_blocked},
 };
@@ -59,22 +67,8 @@ impl ApplicationProvider {
         let mut entries = Vec::new();
         let blocked = load_blocked();
         let allowed = load_allowed();
-        let mut roots = Vec::new();
-        if let Ok(value) = env::var("APPDATA") {
-            roots.push(PathBuf::from(value).join(r"Microsoft\Windows\Start Menu\Programs"));
-        }
-        if let Ok(value) = env::var("PROGRAMDATA") {
-            roots.push(PathBuf::from(value).join(r"Microsoft\Windows\Start Menu\Programs"));
-        }
-        if let Ok(value) = env::var("USERPROFILE") {
-            roots.push(PathBuf::from(value).join("Desktop"));
-        }
-        if let Ok(value) = env::var("PUBLIC") {
-            roots.push(PathBuf::from(value).join("Desktop"));
-        }
-
         let mut readable_roots = 0;
-        for root in roots {
+        for root in shortcut_roots(known_folder_path) {
             if collect_dir(&root, &mut entries, &blocked, &allowed, 8) {
                 readable_roots += 1;
             }
@@ -139,6 +133,28 @@ impl Provider for ApplicationProvider {
             exclusive: false,
         }
     }
+}
+
+fn shortcut_roots(resolve: impl Fn(&GUID) -> Option<PathBuf>) -> impl Iterator<Item = PathBuf> {
+    [
+        (
+            FOLDERID_Programs,
+            "APPDATA",
+            r"Microsoft\Windows\Start Menu\Programs",
+        ),
+        (
+            FOLDERID_CommonPrograms,
+            "PROGRAMDATA",
+            r"Microsoft\Windows\Start Menu\Programs",
+        ),
+        (FOLDERID_Desktop, "USERPROFILE", "Desktop"),
+        (FOLDERID_PublicDesktop, "PUBLIC", "Desktop"),
+    ]
+    .into_iter()
+    .filter_map(move |(id, variable, relative)| {
+        resolve(&id)
+            .or_else(|| env::var_os(variable).map(|root| PathBuf::from(root).join(relative)))
+    })
 }
 
 fn collect_dir(
@@ -462,4 +478,34 @@ pub(crate) fn is_user_blocked(name: &str, blocked: &[String]) -> bool {
 fn matches_patterns(name: &str, patterns: &[String]) -> bool {
     let lower = name.to_lowercase();
     patterns.iter().any(|pattern| lower.contains(pattern))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn indexes_shortcuts_from_a_redirected_desktop() {
+        let root = env::temp_dir().join(format!("quickspark-desktop-{}", std::process::id()));
+        let desktop = root.join("移动的桌面");
+        fs::create_dir_all(&desktop).unwrap();
+        let path = desktop.join("审计示例.lnk");
+        fs::write(&path, []).unwrap();
+        let roots = shortcut_roots(|id| {
+            Some(if id.data1 == FOLDERID_Desktop.data1 {
+                desktop.clone()
+            } else {
+                root.join("missing")
+            })
+        });
+        let mut entries = Vec::new();
+        for directory in roots {
+            collect_dir(&directory, &mut entries, &[], &[], 8);
+        }
+        assert_eq!(entries.len(), 1);
+        assert!(matches!(&entries[0].target, EntryTarget::File(found) if found == &path));
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(desktop).unwrap();
+        fs::remove_dir(root).unwrap();
+    }
 }

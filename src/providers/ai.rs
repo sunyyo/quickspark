@@ -10,7 +10,7 @@ use std::{
 use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 
 use crate::{
-    model::{Action, AiRequest, AiTask, Query, ResultItem, WebSearchMode},
+    model::{Action, AiCompletion, AiRequest, AiTask, Query, ResultItem, WebSearchMode},
     platform::windows::{ai_api_key_exists, tavily_api_key_exists},
     storage::{AiConfig, ai_config_file, load_ai_config},
 };
@@ -59,7 +59,7 @@ pub(crate) enum AiEvent {
     },
     Finished {
         generation: u64,
-        finish_reason: Option<String>,
+        completion: AiCompletion,
     },
     Failed {
         generation: u64,
@@ -75,7 +75,7 @@ pub(crate) struct AiProvider {
 struct AiResponse {
     answer: String,
     reasoning: String,
-    finish_reason: Option<String>,
+    completion: AiCompletion,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -100,7 +100,6 @@ enum AiState {
 
 impl AiService {
     pub(crate) fn new(window: usize, ready_message: u32) -> Self {
-        let _ = ai_config_file();
         Self {
             state: Arc::new(Mutex::new(AiState::Idle)),
             events: Arc::new(Mutex::new(VecDeque::new())),
@@ -243,7 +242,7 @@ fn finish_event_if_current(
     let event = match &result {
         Ok(response) => AiEvent::Finished {
             generation,
-            finish_reason: response.finish_reason.clone(),
+            completion: response.completion,
         },
         Err(error) => AiEvent::Failed {
             generation,
@@ -430,7 +429,7 @@ impl AiProvider {
                 } else {
                     config.model.as_str()
                 },
-                if ai_api_key_exists() {
+                if ai_api_key_exists(&config.api_url) {
                     "已安全保存"
                 } else {
                     "未设置（本地无鉴权接口可留空）"
@@ -530,7 +529,7 @@ fn ai_settings() -> ProviderOutput {
                 provider_id: PROVIDER_ID,
                 title: format!(
                     "API Key：{}（Enter 安全设置）",
-                    if ai_api_key_exists() {
+                    if ai_api_key_exists(&config.api_url) {
                         "已保存到 Windows 凭据管理器"
                     } else {
                         "未设置"
@@ -569,10 +568,15 @@ fn answer_result(request: &AiRequest, response: &AiResponse) -> ResultItem {
     let display_prompt = request.display_prompt.clone();
     let reasoning = response.reasoning.clone();
     let answer = response.answer.clone();
+    let view_hint = if response.completion == AiCompletion::Complete {
+        "Enter 查看全文".to_owned()
+    } else {
+        format!("{}，Enter 查看", response.completion.status())
+    };
     ResultItem {
         provider_id: PROVIDER_ID,
         title: format!(
-            "{}：{}（Enter 查看全文）",
+            "{}：{}（{view_hint}）",
             request.result_label,
             preview(&response.answer, 88)
         ),
@@ -582,6 +586,7 @@ fn answer_result(request: &AiRequest, response: &AiResponse) -> ResultItem {
                 prompt: display_prompt,
                 answer: answer.clone(),
                 reasoning,
+                completion: response.completion,
             },
             Action::CopyText { text: answer },
             Action::RegenerateAi {
