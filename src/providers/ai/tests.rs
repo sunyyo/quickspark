@@ -151,6 +151,9 @@ fn builds_openai_compatible_request_without_leaking_configuration() {
     let text = String::from_utf8(request_body(&thinking, &question)).unwrap();
     assert!(text.contains("\"thinking\":{\"type\":\"enabled\"}"));
     assert!(text.contains("\"reasoning_effort\":\"max\""));
+    let planner = String::from_utf8(agent_request_body(&thinking, "controller", "decide")).unwrap();
+    assert!(planner.contains("\"thinking\":{\"type\":\"disabled\"}"));
+    assert!(!planner.contains("reasoning_effort"));
 
     thinking.thinking_mode = ThinkingMode::Disabled;
     let text = String::from_utf8(request_body(&thinking, &question)).unwrap();
@@ -371,6 +374,10 @@ fn posts_to_a_local_openai_compatible_endpoint() {
             AiCompletion::LengthLimit,
         ),
         ("", AiCompletion::Interrupted),
+        (
+            "data: {\"choices\":[{\"delta\":{\"content\":\"残缺",
+            AiCompletion::Interrupted,
+        ),
     ] {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
         let address = listener.local_addr().unwrap();
@@ -546,4 +553,84 @@ fn refuses_redirects_instead_of_forwarding_bearer_credentials() {
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
         ));
     }
+}
+
+#[test]
+fn streaming_sse_enforces_decoded_limit_instead_of_4mb_wire_envelope() {
+    let frame = format!(
+        "data: {{\"id\":\"chatcmpl-0123456789abcdef\",\"object\":\"chat.completion.chunk\",\"created\":1731900000,\"model\":\"deepseek-reasoner\",\"system_fingerprint\":\"{}\",\"choices\":[{{\"index\":0,\"delta\":{{\"content\":\"a\"}},\"logprobs\":null,\"finish_reason\":null}}]}}\n\n",
+        "x".repeat(80)
+    );
+    let repeat = (4 * 1024 * 1024 / frame.len()) + 50;
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let _ = read_http_request(&mut stream);
+        // Each SSE frame has ~310 bytes of JSON envelope around a 1-byte token,
+        // exceeding 4 MB raw wire traffic while decoded text stays tiny (~14 KB).
+        let done =
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}]}\n\ndata: [DONE]\n\n";
+        let total_size = frame.len() * repeat + done.len();
+        assert!(total_size > 4 * 1024 * 1024);
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {total_size}\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+        let batch = frame.repeat(128);
+        let mut remaining = repeat;
+        while remaining >= 128 {
+            stream.write_all(batch.as_bytes()).unwrap();
+            remaining -= 128;
+        }
+        for _ in 0..remaining {
+            stream.write_all(frame.as_bytes()).unwrap();
+        }
+        stream.write_all(done.as_bytes()).unwrap();
+        stream.flush().unwrap();
+    });
+
+    let config = AiConfig {
+        api_url: format!("http://{address}/v1/chat/completions"),
+        model: "local-test".to_owned(),
+        system_prompt: String::new(),
+        max_tokens: 32,
+        timeout_seconds: 10,
+        ..AiConfig::default()
+    };
+    let body = request_body(&config, &question_request("长流测试"));
+    let response = winhttp_stream_json(
+        &config,
+        "test-key",
+        &body,
+        RequestContext::standalone(),
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(response.completion, AiCompletion::Complete);
+    assert_eq!(response.answer.len(), repeat);
+    server.join().unwrap();
+}
+
+#[test]
+fn rejects_control_characters_in_bearer_api_key() {
+    let config = AiConfig {
+        api_url: "http://127.0.0.1:1/v1/chat/completions".to_owned(),
+        model: "local-test".to_owned(),
+        ..AiConfig::default()
+    };
+    let body = request_body(&config, &question_request("测试"));
+    let error = winhttp_stream_json(
+        &config,
+        "bad-key\r\nX-Injected: 1",
+        &body,
+        RequestContext::standalone(),
+        |_| {},
+    )
+    .unwrap_err();
+    assert!(error.contains("控制字符"), "unexpected error: {error}");
 }

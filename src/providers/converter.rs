@@ -194,9 +194,25 @@ fn parse_date_query(input: &str) -> Option<String> {
     let remaining = parts.collect::<Vec<_>>();
     let result = match remaining.as_slice() {
         [] => date,
+        [delta] => {
+            let (positive, amount) = if let Some(rest) = delta.strip_prefix('+') {
+                (true, rest)
+            } else if let Some(rest) = delta.strip_prefix('-') {
+                (false, rest)
+            } else {
+                return None;
+            };
+            let days = parse_day_delta(amount)?;
+            let signed_days = if positive { days } else { days.checked_neg()? };
+            add_days(date, signed_days)?
+        }
         [operator, amount] if matches!(*operator, "+" | "-") => {
             let days = parse_day_delta(amount)?;
-            let signed_days = if *operator == "+" { days } else { -days };
+            let signed_days = if *operator == "+" {
+                days
+            } else {
+                days.checked_neg()?
+            };
             add_days(date, signed_days)?
         }
         _ => return None,
@@ -206,13 +222,17 @@ fn parse_date_query(input: &str) -> Option<String> {
 
 fn parse_day_delta(value: &str) -> Option<i64> {
     let lower = value.to_ascii_lowercase();
-    if let Some(days) = lower.strip_suffix('d') {
-        return days.parse().ok();
+    let (digits, multiplier) = if let Some(days) = lower.strip_suffix('d') {
+        (days, 1i64)
+    } else if let Some(weeks) = lower.strip_suffix('w') {
+        (weeks, 7i64)
+    } else {
+        return None;
+    };
+    if digits.is_empty() || !digits.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
     }
-    lower
-        .strip_suffix('w')
-        .and_then(|weeks| weeks.parse::<i64>().ok())
-        .and_then(|weeks| weeks.checked_mul(7))
+    digits.parse::<i64>().ok()?.checked_mul(multiplier)
 }
 
 fn parse_date(value: &str) -> Option<(i32, u32, u32)> {
@@ -244,7 +264,12 @@ fn is_leap_year(year: i32) -> bool {
 }
 
 fn add_days(date: (i32, u32, u32), days: i64) -> Option<(i32, u32, u32)> {
+    let min_serial = days_from_civil(1, 1, 1);
+    let max_serial = days_from_civil(9_999, 12, 31);
     let serial = days_from_civil(date.0, date.1, date.2).checked_add(days)?;
+    if !(min_serial..=max_serial).contains(&serial) {
+        return None;
+    }
     let result = civil_from_days(serial);
     valid_date(result.0, result.1, result.2).then_some(result)
 }
@@ -304,18 +329,27 @@ fn parse_integer(value: &str, default_radix: u32) -> Option<(bool, u128)> {
     if unsigned.is_empty() {
         return None;
     }
-    let (radix, digits) = if let Some(digits) = unsigned.strip_prefix("0x") {
+    let (radix, digits) = if let Some(digits) = unsigned
+        .strip_prefix("0x")
+        .or_else(|| unsigned.strip_prefix("0X"))
+    {
         (16, digits)
-    } else if let Some(digits) = unsigned.strip_prefix("0b") {
+    } else if let Some(digits) = unsigned
+        .strip_prefix("0b")
+        .or_else(|| unsigned.strip_prefix("0B"))
+    {
         (2, digits)
-    } else if let Some(digits) = unsigned.strip_prefix("0o") {
+    } else if let Some(digits) = unsigned
+        .strip_prefix("0o")
+        .or_else(|| unsigned.strip_prefix("0O"))
+    {
         (8, digits)
     } else {
         (default_radix, unsigned)
     };
     u128::from_str_radix(digits, radix)
         .ok()
-        .map(|magnitude| (negative, magnitude))
+        .map(|magnitude| (negative && magnitude != 0, magnitude))
 }
 
 #[cfg(test)]
@@ -340,11 +374,30 @@ mod tests {
             Some("2024-02-29")
         );
         assert_eq!(
+            parse_date_query("date 2024-02-28 +1d").as_deref(),
+            Some("2024-02-29")
+        );
+        assert_eq!(
             parse_date_query("date 2026-07-22 - 2w").as_deref(),
+            Some("2026-07-08")
+        );
+        assert_eq!(
+            parse_date_query("date 2026-07-22 -2w").as_deref(),
             Some("2026-07-08")
         );
         assert_eq!(add_days((2026, 12, 31), 1), Some((2027, 1, 1)));
         assert_eq!(parse_date_query("date 2025-02-29"), None);
+        assert_eq!(parse_date_query("date 2026-01-01 + 1568705288031d"), None);
+        assert_eq!(
+            parse_date_query("date 2026-01-01 + 9223372036854700000d"),
+            None
+        );
+        assert_eq!(
+            parse_date_query("date 2026-01-01 - -9223372036854775808d"),
+            None
+        );
+        assert_eq!(add_days((2026, 1, 1), i64::MIN), None);
+        assert_eq!(add_days((2026, 1, 1), i64::MAX), None);
     }
 
     #[test]
@@ -354,5 +407,10 @@ mod tests {
         assert_eq!(parse_base_query("oct 8").as_deref(), Some("0o10"));
         assert_eq!(parse_base_query("dec FF").as_deref(), Some("255"));
         assert_eq!(parse_base_query("dec 0b1010").as_deref(), Some("10"));
+        assert_eq!(parse_base_query("dec 0XFF").as_deref(), Some("255"));
+        assert_eq!(parse_base_query("dec 0B1010").as_deref(), Some("10"));
+        assert_eq!(parse_base_query("dec 0O10").as_deref(), Some("8"));
+        assert_eq!(parse_base_query("hex -0").as_deref(), Some("0x0"));
+        assert_eq!(parse_base_query("dec -0").as_deref(), Some("0"));
     }
 }

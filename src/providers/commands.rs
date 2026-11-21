@@ -41,38 +41,7 @@ impl Provider for CommandProvider {
             );
         }
 
-        let (alias, arguments) = split_command_terms(terms);
-        let exact = commands
-            .iter()
-            .any(|command| command.alias.eq_ignore_ascii_case(alias));
-        let results = commands
-            .iter()
-            .filter(|command| {
-                if terms.is_empty() {
-                    true
-                } else if exact {
-                    command.alias.eq_ignore_ascii_case(alias)
-                } else {
-                    let searchable = format!("{} {}", command.alias, command.title).to_lowercase();
-                    searchable.contains(&terms.to_lowercase())
-                }
-            })
-            .enumerate()
-            .map(|(position, command)| {
-                let action = command_action(command, arguments);
-                ResultItem {
-                    provider_id: PROVIDER_ID,
-                    title: format!("{}：{}", command.alias, command.title),
-                    score: 100_000 - position as i32,
-                    actions: vec![
-                        action,
-                        Action::CopyText {
-                            text: command.target.clone(),
-                        },
-                    ],
-                }
-            })
-            .collect::<Vec<_>>();
+        let results = match_commands(&commands, terms);
         if results.is_empty() {
             return message(
                 &format!("没有找到“{terms}”指令；输入 ; edit 编辑配置"),
@@ -86,6 +55,41 @@ impl Provider for CommandProvider {
     }
 }
 
+fn match_commands(commands: &[CustomCommand], terms: &str) -> Vec<ResultItem> {
+    let (alias, arguments) = split_command_terms(terms);
+    let exact = commands
+        .iter()
+        .any(|command| command.alias.eq_ignore_ascii_case(alias));
+    commands
+        .iter()
+        .filter(|command| {
+            if terms.is_empty() {
+                true
+            } else if exact {
+                command.alias.eq_ignore_ascii_case(alias)
+            } else {
+                let searchable = format!("{} {}", command.alias, command.title).to_lowercase();
+                searchable.contains(&terms.to_lowercase())
+            }
+        })
+        .enumerate()
+        .map(|(position, command)| {
+            let action = command_action(command, if exact { arguments } else { "" });
+            ResultItem {
+                provider_id: PROVIDER_ID,
+                title: format!("{}：{}", command.alias, command.title),
+                score: 100_000 - position as i32,
+                actions: vec![
+                    action,
+                    Action::CopyText {
+                        text: command.target.clone(),
+                    },
+                ],
+            }
+        })
+        .collect()
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct CustomCommand {
     alias: String,
@@ -94,7 +98,9 @@ struct CustomCommand {
 }
 
 fn parse_commands(text: &str) -> Vec<CustomCommand> {
-    text.lines()
+    text.strip_prefix('\u{feff}')
+        .unwrap_or(text)
+        .lines()
         .filter_map(|line| {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -132,26 +138,32 @@ fn split_command_terms(terms: &str) -> (&str, &str) {
 }
 
 fn command_action(command: &CustomCommand, arguments: &str) -> Action {
-    let mut target = expand_environment(&command.target);
-    let replacement = if target.trim_start_matches("url:").starts_with("http://")
-        || target.trim_start_matches("url:").starts_with("https://")
-    {
+    let expanded = expand_environment(&command.target);
+    let trimmed = expanded.trim();
+    let stripped = strip_prefix_ascii_case(trimmed, "url:")
+        .or_else(|| strip_prefix_ascii_case(trimmed, "path:"))
+        .unwrap_or(trimmed)
+        .trim();
+    let is_http = strip_prefix_ascii_case(stripped, "http://").is_some()
+        || strip_prefix_ascii_case(stripped, "https://").is_some();
+    let replacement = if is_http {
         url_encode(arguments)
     } else {
         arguments.to_owned()
     };
-    target = target.replace("{query}", &replacement);
-    let target = target
-        .strip_prefix("url:")
-        .or_else(|| target.strip_prefix("path:"))
-        .unwrap_or(&target)
-        .trim()
-        .to_owned();
-    if target.starts_with("http://") || target.starts_with("https://") {
+    let target = stripped.replace("{query}", &replacement);
+    if is_http {
         Action::OpenUrl { url: target }
     } else {
         Action::OpenTarget { target }
     }
+}
+
+fn strip_prefix_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    value
+        .get(..prefix.len())
+        .filter(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        .map(|_| &value[prefix.len()..])
 }
 
 fn expand_environment(value: &str) -> String {
@@ -193,7 +205,8 @@ fn message(title: &str, actions: Vec<Action>) -> ProviderOutput {
 #[cfg(test)]
 mod tests {
     use super::{
-        CustomCommand, command_action, commands_query, expand_environment, parse_commands,
+        CustomCommand, command_action, commands_query, expand_environment, match_commands,
+        parse_commands,
     };
     use crate::model::Action;
 
@@ -239,6 +252,35 @@ mod tests {
         assert!(matches!(
             command_action(&command, "rust 语言"),
             Action::OpenUrl { url } if url.ends_with("rust%20%E8%AF%AD%E8%A8%80")
+        ));
+
+        let prefixed = CustomCommand {
+            alias: "gh2".to_owned(),
+            title: "GitHub".to_owned(),
+            target: "URL: HTTPS://github.com/search?q={query}".to_owned(),
+        };
+        assert!(matches!(
+            command_action(&prefixed, "rust 语言"),
+            Action::OpenUrl { url } if url == "HTTPS://github.com/search?q=rust%20%E8%AF%AD%E8%A8%80"
+        ));
+
+        let bom_commands =
+            parse_commands("\u{feff}gh | 搜索 GitHub | https://github.com/search?q={query}\n");
+        assert_eq!(bom_commands.len(), 1);
+        assert_eq!(bom_commands[0].alias, "gh");
+
+        let by_title = match_commands(&bom_commands, "搜索 GitHub");
+        assert_eq!(by_title.len(), 1);
+        assert!(matches!(
+            by_title[0].primary_action(),
+            Some(Action::OpenUrl { url }) if url == "https://github.com/search?q="
+        ));
+
+        let by_alias = match_commands(&bom_commands, "gh rust");
+        assert_eq!(by_alias.len(), 1);
+        assert!(matches!(
+            by_alias[0].primary_action(),
+            Some(Action::OpenUrl { url }) if url == "https://github.com/search?q=rust"
         ));
     }
 

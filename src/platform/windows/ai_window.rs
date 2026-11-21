@@ -1,6 +1,6 @@
 use std::{
     borrow::Cow,
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashMap,
     ptr::{null, null_mut},
     rc::Rc,
@@ -13,10 +13,11 @@ use windows_sys::Win32::{
     Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute},
     Graphics::Gdi::{
         CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, CreatePen, CreateSolidBrush,
-        DEFAULT_CHARSET, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_SINGLELINE, DT_VCENTER,
-        DeleteObject, DrawFocusRect, DrawTextW, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, FillRect,
-        HBRUSH, HDC, HFONT, InvalidateRect, OUT_DEFAULT_PRECIS, PS_SOLID, RoundRect, SelectObject,
-        SetBkColor, SetBkMode, SetTextColor, TRANSPARENT, UpdateWindow,
+        DEFAULT_CHARSET, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
+        DT_VCENTER, DeleteObject, DrawFocusRect, DrawTextW, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD,
+        FillRect, GetMonitorInfoW, HBRUSH, HDC, HFONT, InvalidateRect, MONITOR_DEFAULTTONEAREST,
+        MONITORINFO, MonitorFromPoint, MonitorFromWindow, OUT_DEFAULT_PRECIS, PS_SOLID, RoundRect,
+        SelectObject, SetBkColor, SetBkMode, SetTextColor, TRANSPARENT, UpdateWindow,
     },
     System::LibraryLoader::{GetModuleHandleW, LoadLibraryW},
     UI::{
@@ -30,11 +31,12 @@ use windows_sys::Win32::{
         WindowsAndMessaging::{
             BM_CLICK, BS_OWNERDRAW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CreateWindowExW,
             DefWindowProcW, DestroyWindow, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY,
-            GetClientRect, GetNextDlgTabItem, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
-            IDC_ARROW, IsWindow, KillTimer, LoadCursorW, MB_ICONERROR, MB_OK, MINMAXINFO,
-            MessageBoxW, MoveWindow, PostMessageW, RegisterClassW, SW_HIDE, SW_SHOW, SendMessageW,
-            SetForegroundWindow, SetTimer, SetWindowTextW, ShowWindow, WM_CLOSE, WM_COMMAND,
-            WM_COPY, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY,
+            GetClientRect, GetCursorPos, GetNextDlgTabItem, GetWindowRect, GetWindowTextLengthW,
+            GetWindowTextW, IDC_ARROW, IsWindow, KillTimer, LoadCursorW, MB_ICONERROR, MB_OK,
+            MINMAXINFO, MessageBoxW, MoveWindow, PostMessageW, RegisterClassW, SW_HIDE, SW_SHOW,
+            SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer,
+            SetWindowPos, SetWindowTextW, ShowWindow, WM_CLOSE, WM_COMMAND, WM_COPY, WM_CREATE,
+            WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED,
             WM_DRAWITEM, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_NCDESTROY, WM_SETFOCUS,
             WM_SETFONT, WM_SETREDRAW, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CHILD, WS_EX_TOOLWINDOW,
             WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
@@ -77,6 +79,7 @@ const EM_SETSEL: u32 = 0x00B1;
 const EM_SCROLLCARET: u32 = 0x00B7;
 const EM_SETBKGNDCOLOR: u32 = 0x0443;
 const EM_SETCHARFORMAT: u32 = 0x0444;
+const SS_NOPREFIX: u32 = 0x0080;
 const EC_LEFTMARGIN: usize = 0x0001;
 const EC_RIGHTMARGIN: usize = 0x0002;
 const SCF_SELECTION: usize = 0x0001;
@@ -160,12 +163,11 @@ static RICH_EDIT_LOADED: OnceLock<bool> = OnceLock::new();
 
 // Drawing callbacks use fixed data without borrowing the mutable model that
 // initiated a synchronous Win32 repaint.
-#[derive(Clone, Copy)]
 struct AnswerPaint {
     answer_edit: HWND,
     thinking_edit: HWND,
     hint: HWND,
-    hint_font: HFONT,
+    hint_font: Cell<HFONT>,
     window_brush: HBRUSH,
     answer_brush: HBRUSH,
     colors: AnswerColors,
@@ -314,9 +316,14 @@ fn show_answer_window(mut init: AnswerInit) -> Option<HWND> {
     let width = scale(DEFAULT_WINDOW_WIDTH, dpi);
     let height = scale(DEFAULT_WINDOW_HEIGHT, dpi);
     let mut owner_rect: RECT = unsafe { std::mem::zeroed() };
-    unsafe { GetWindowRect(init.owner, &mut owner_rect) };
-    let x = owner_rect.left + (owner_rect.right - owner_rect.left - width) / 2;
-    let y = owner_rect.top;
+    let has_owner_rect =
+        !init.owner.is_null() && unsafe { GetWindowRect(init.owner, &mut owner_rect) } != 0;
+    let work = monitor_work_area(init.owner);
+    let (x, y, width, height) = if has_owner_rect {
+        clamp_window_rect(owner_rect, work, width, height)
+    } else {
+        clamp_window_rect(work, work, width, height)
+    };
     let window = unsafe {
         CreateWindowExW(
             WS_EX_TOOLWINDOW,
@@ -350,6 +357,42 @@ fn show_answer_window(mut init: AnswerInit) -> Option<HWND> {
         SetForegroundWindow(window);
     }
     Some(window)
+}
+
+fn monitor_work_area(window: HWND) -> RECT {
+    let monitor = if !window.is_null() {
+        unsafe { MonitorFromWindow(window, MONITOR_DEFAULTTONEAREST) }
+    } else {
+        let mut cursor = unsafe { std::mem::zeroed() };
+        unsafe {
+            GetCursorPos(&mut cursor);
+            MonitorFromPoint(cursor, MONITOR_DEFAULTTONEAREST)
+        }
+    };
+    let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    if !monitor.is_null() && unsafe { GetMonitorInfoW(monitor, &mut info) } != 0 {
+        info.rcWork
+    } else {
+        RECT {
+            left: 0,
+            top: 0,
+            right: DEFAULT_WINDOW_WIDTH,
+            bottom: DEFAULT_WINDOW_HEIGHT,
+        }
+    }
+}
+
+fn clamp_window_rect(anchor: RECT, work: RECT, width: i32, height: i32) -> (i32, i32, i32, i32) {
+    let work_width = (work.right - work.left).max(1);
+    let work_height = (work.bottom - work.top).max(1);
+    let clamped_width = width.min(work_width);
+    let clamped_height = height.min(work_height);
+    let desired_x = anchor.left + (anchor.right - anchor.left - clamped_width) / 2;
+    let desired_y = anchor.top;
+    let x = desired_x.clamp(work.left, work.right - clamped_width);
+    let y = desired_y.clamp(work.top, work.bottom - clamped_height);
+    (x, y, clamped_width, clamped_height)
 }
 
 pub(crate) fn append_ai_reasoning(window: HWND, text: &str) -> bool {
@@ -456,9 +499,29 @@ unsafe extern "system" fn answer_window_proc(
         }
         WM_GETMINMAXINFO => {
             let dpi = unsafe { GetDpiForWindow(window) }.max(96);
+            let work = monitor_work_area(window);
+            let max_w = (work.right - work.left).max(1);
+            let max_h = (work.bottom - work.top).max(1);
             let limits = unsafe { &mut *(lparam as *mut MINMAXINFO) };
-            limits.ptMinTrackSize.x = scale(640, dpi);
-            limits.ptMinTrackSize.y = scale(520, dpi);
+            limits.ptMinTrackSize.x = scale(640, dpi).min(max_w);
+            limits.ptMinTrackSize.y = scale(520, dpi).min(max_h);
+            0
+        }
+        WM_DPICHANGED => {
+            let dpi = ((wparam & 0xffff) as u32).max(96);
+            let rect = unsafe { &*(lparam as *const RECT) };
+            unsafe {
+                apply_answer_dpi(window, dpi);
+                SetWindowPos(
+                    window,
+                    null_mut(),
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+            }
             0
         }
         WM_DRAWITEM => with_answer_paint(window, |paint| {
@@ -590,7 +653,7 @@ fn copy_answer(window: HWND, thinking: bool) {
     }) else {
         return;
     };
-    if thinking && text.is_empty() {
+    if text.is_empty() {
         return;
     }
     if copy_text(window, &text) {
@@ -710,7 +773,7 @@ unsafe fn create_answer_window(window: HWND, lparam: LPARAM) -> LRESULT {
         thinking_visible,
         thinking_expanded: false,
         thinking_complete: !init.streaming,
-        thinking_started: init.streaming.then(Instant::now),
+        thinking_started: None,
         thinking_elapsed_ms: None,
         owner: init.owner,
         cancel_message: init.cancel_message,
@@ -725,7 +788,7 @@ unsafe fn create_answer_window(window: HWND, lparam: LPARAM) -> LRESULT {
         answer_edit: state.answer_edit,
         thinking_edit: state.thinking_edit,
         hint: state.hint,
-        hint_font: state.hint_font,
+        hint_font: Cell::new(state.hint_font),
         window_brush: state.window_brush,
         answer_brush: state.answer_brush,
         colors: state.colors,
@@ -787,7 +850,7 @@ unsafe fn create_answer_window(window: HWND, lparam: LPARAM) -> LRESULT {
                 (horizontal_margin | (horizontal_margin << 16)) as LPARAM,
             );
         }
-        render_answer(state);
+        render_answer(state, false);
         update_thinking_header(state);
         SetWindowSubclass(
             state.answer_edit,
@@ -843,11 +906,11 @@ unsafe extern "system" fn answer_edit_proc(
             return 0;
         }
         let control = unsafe { GetKeyState(VK_CONTROL as i32) as u16 & 0x8000 != 0 };
-        if control && matches!(wparam as u32, 0x41 | 0x61) {
+        if control && subclass_id != BUTTON_SUBCLASS_ID && wparam as u32 == 0x41 {
             unsafe { SendMessageW(edit, EM_SETSEL, 0, -1) };
             return 0;
         }
-        if control && matches!(wparam as u32, 0x43 | 0x63) {
+        if control && subclass_id != BUTTON_SUBCLASS_ID && wparam as u32 == 0x43 {
             unsafe { SendMessageW(edit, WM_COPY, 0, 0) };
             return 0;
         }
@@ -1076,7 +1139,7 @@ unsafe fn flush_render(window: HWND, state: &mut AnswerWindow) {
     if state.streaming {
         unsafe { render_plain_answer(state) };
     } else {
-        unsafe { render_answer(state) };
+        unsafe { render_answer(state, true) };
     }
 }
 
@@ -1248,7 +1311,7 @@ unsafe fn create_static(parent: HWND, text: &str) -> HWND {
             0,
             wide("STATIC").as_ptr(),
             wide(text).as_ptr(),
-            WS_CHILD | WS_VISIBLE,
+            WS_CHILD | WS_VISIBLE | SS_NOPREFIX,
             0,
             0,
             0,
@@ -1258,6 +1321,79 @@ unsafe fn create_static(parent: HWND, text: &str) -> HWND {
             GetModuleHandleW(null()),
             null(),
         )
+    }
+}
+
+unsafe fn apply_answer_dpi(window: HWND, dpi: u32) {
+    let Some(shared) = answer_window_state(window) else {
+        return;
+    };
+    let heading_font = create_font(dpi, 17, FW_SEMIBOLD);
+    let body_font = create_font(dpi, ANSWER_FONT_PIXELS, FW_NORMAL);
+    let hint_font = create_font(dpi, 14, FW_NORMAL);
+    let answer_font = create_font(dpi, ANSWER_FONT_PIXELS, FW_NORMAL);
+    if heading_font.is_null() || body_font.is_null() || hint_font.is_null() || answer_font.is_null()
+    {
+        unsafe {
+            delete_font(heading_font);
+            delete_font(body_font);
+            delete_font(hint_font);
+            delete_font(answer_font);
+        }
+        return;
+    }
+    let Ok(mut state) = shared.model.try_borrow_mut() else {
+        unsafe {
+            delete_font(heading_font);
+            delete_font(body_font);
+            delete_font(hint_font);
+            delete_font(answer_font);
+        }
+        return;
+    };
+    let old_fonts = [
+        std::mem::replace(&mut state.heading_font, heading_font),
+        std::mem::replace(&mut state.body_font, body_font),
+        std::mem::replace(&mut state.hint_font, hint_font),
+        std::mem::replace(&mut state.answer_font, answer_font),
+    ];
+    shared.paint.hint_font.set(hint_font);
+    unsafe {
+        for control in [state.question_label, state.answer_label] {
+            SendMessageW(control, WM_SETFONT, state.heading_font as WPARAM, 1);
+        }
+        SendMessageW(state.prompt, WM_SETFONT, state.body_font as WPARAM, 1);
+        SendMessageW(
+            state.answer_edit,
+            WM_SETFONT,
+            state.answer_font as WPARAM,
+            1,
+        );
+        for control in [
+            state.hint,
+            state.copy_button,
+            state.stop_button,
+            state.close_button,
+            state.thinking_toggle,
+            state.thinking_copy,
+            state.thinking_edit,
+        ] {
+            SendMessageW(control, WM_SETFONT, state.hint_font as WPARAM, 1);
+        }
+        let horizontal_margin = scale(12, dpi) as u32;
+        for edit in [state.answer_edit, state.thinking_edit] {
+            SendMessageW(
+                edit,
+                EM_SETMARGINS,
+                EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                (horizontal_margin | (horizontal_margin << 16)) as LPARAM,
+            );
+        }
+        for font in old_fonts {
+            delete_font(font);
+        }
+        layout(window, &state);
+        InvalidateRect(window, null(), 1);
     }
 }
 
@@ -1330,7 +1466,7 @@ unsafe fn draw_button(draw: &DRAWITEMSTRUCT, state: &AnswerPaint) {
     let inset = scale(if quiet { 2 } else { 10 }, dpi);
     text_rect.left += inset;
     text_rect.right -= inset;
-    let old_font = unsafe { SelectObject(draw.hDC, state.hint_font as _) };
+    let old_font = unsafe { SelectObject(draw.hDC, state.hint_font.get() as _) };
     unsafe {
         GetWindowTextW(draw.hwndItem, text.as_mut_ptr(), text.len() as i32);
         SetBkMode(draw.hDC, TRANSPARENT as i32);
@@ -1350,6 +1486,7 @@ unsafe fn draw_button(draw: &DRAWITEMSTRUCT, state: &AnswerPaint) {
             DT_SINGLELINE
                 | DT_VCENTER
                 | DT_END_ELLIPSIS
+                | DT_NOPREFIX
                 | if draw.CtlID as usize == THINK_TOGGLE_ID {
                     DT_LEFT
                 } else {

@@ -19,7 +19,7 @@ impl Provider for WebSearchProvider {
             return ProviderOutput {
                 results: vec![ResultItem {
                     provider_id: PROVIDER_ID,
-                    title: "网页搜索：在 ss / bd / bing / gg 后输入关键词".to_owned(),
+                    title: "网页搜索：在 ss / web / bd / bing / gg 后输入关键词".to_owned(),
                     score: 100_000,
                     actions: Vec::new(),
                 }],
@@ -54,7 +54,7 @@ impl Provider for WebSearchProvider {
 }
 
 fn is_empty_web_prefix(input: &str) -> bool {
-    ["ss", "bd", "baidu", "bing", "gg", "google"]
+    ["ss", "web", "bd", "bing", "gg"]
         .iter()
         .any(|prefix| input.trim().eq_ignore_ascii_case(prefix))
 }
@@ -130,7 +130,7 @@ pub(crate) fn url_encode(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_web_searches_with_engine;
+    use super::{is_empty_web_prefix, parse_web_searches_with_engine};
     use crate::storage::WebEngine;
 
     #[test]
@@ -140,5 +140,18 @@ mod tests {
         let default = parse_web_searches_with_engine("web rust", WebEngine::Bing).unwrap();
         assert_eq!(default.len(), 1);
         assert!(default[0].label.starts_with("使用必应"));
+    }
+
+    #[test]
+    fn empty_prefixes_match_supported_commands_without_stealing_app_names() {
+        for prefix in ["ss", "web", "bd", "bing", "gg", "WEB"] {
+            assert!(is_empty_web_prefix(prefix), "{prefix} should match");
+        }
+        for app_query in ["google", "baidu", "google chrome"] {
+            assert!(
+                !is_empty_web_prefix(app_query),
+                "{app_query} should not be hijacked"
+            );
+        }
     }
 }

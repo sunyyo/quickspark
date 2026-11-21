@@ -68,8 +68,8 @@ impl ApplicationProvider {
         let blocked = load_blocked();
         let allowed = load_allowed();
         let mut readable_roots = 0;
-        for root in shortcut_roots(known_folder_path) {
-            if collect_dir(&root, &mut entries, &blocked, &allowed, 8) {
+        for (root, max_depth) in shortcut_roots(known_folder_path) {
+            if collect_dir(&root, &mut entries, &blocked, &allowed, max_depth) {
                 readable_roots += 1;
             }
         }
@@ -135,25 +135,30 @@ impl Provider for ApplicationProvider {
     }
 }
 
-fn shortcut_roots(resolve: impl Fn(&GUID) -> Option<PathBuf>) -> impl Iterator<Item = PathBuf> {
+fn shortcut_roots(
+    resolve: impl Fn(&GUID) -> Option<PathBuf>,
+) -> impl Iterator<Item = (PathBuf, u8)> {
     [
         (
             FOLDERID_Programs,
             "APPDATA",
             r"Microsoft\Windows\Start Menu\Programs",
+            8u8,
         ),
         (
             FOLDERID_CommonPrograms,
             "PROGRAMDATA",
             r"Microsoft\Windows\Start Menu\Programs",
+            8u8,
         ),
-        (FOLDERID_Desktop, "USERPROFILE", "Desktop"),
-        (FOLDERID_PublicDesktop, "PUBLIC", "Desktop"),
+        (FOLDERID_Desktop, "USERPROFILE", "Desktop", 1u8),
+        (FOLDERID_PublicDesktop, "PUBLIC", "Desktop", 1u8),
     ]
     .into_iter()
-    .filter_map(move |(id, variable, relative)| {
+    .filter_map(move |(id, variable, relative, max_depth)| {
         resolve(&id)
             .or_else(|| env::var_os(variable).map(|root| PathBuf::from(root).join(relative)))
+            .map(|path| (path, max_depth))
     })
 }
 
@@ -171,9 +176,19 @@ fn collect_dir(
         return false;
     };
     for item in items.flatten() {
+        let Ok(file_type) = item.file_type() else {
+            continue;
+        };
         let path = item.path();
-        if path.is_dir() {
-            collect_dir(&path, out, blocked, allowed, depth - 1);
+        if file_type.is_symlink() {
+            // Avoid traversing directory junctions or symlinks into arbitrary trees.
+            if path.is_dir() {
+                continue;
+            }
+        } else if file_type.is_dir() {
+            if depth > 1 {
+                collect_dir(&path, out, blocked, allowed, depth - 1);
+            }
             continue;
         }
         let extension = path
@@ -265,10 +280,23 @@ fn collect_packaged_apps(out: &mut Vec<Entry>, blocked: &[String], allowed: &[St
         return false;
     }
     let text = String::from_utf8_lossy(&bytes);
-    for (name, app_id) in parse_start_apps(&text) {
+    collect_packaged_entries(&text, out, blocked, allowed);
+    true
+}
+
+fn collect_packaged_entries(
+    output: &str,
+    out: &mut Vec<Entry>,
+    blocked: &[String],
+    allowed: &[String],
+) {
+    for (name, app_id) in parse_start_apps(output) {
         let explicitly_allowed = matches_patterns(&name, allowed);
         if !explicitly_allowed
-            && (is_uninstaller(&name) || is_blocked_tool(&name) || is_user_blocked(&name, blocked))
+            && (is_uninstaller(&name)
+                || is_blocked_tool(&name)
+                || is_system_setting(&name)
+                || is_user_blocked(&name, blocked))
         {
             continue;
         }
@@ -281,7 +309,6 @@ fn collect_packaged_apps(out: &mut Vec<Entry>, blocked: &[String], allowed: &[St
             target: EntryTarget::Packaged(app_id),
         });
     }
-    true
 }
 
 fn system_program(relative: &str) -> Option<PathBuf> {
@@ -485,12 +512,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn indexes_shortcuts_from_a_redirected_desktop() {
+    fn indexes_shortcuts_from_a_redirected_desktop_without_recursing_into_subfolders() {
         let root = env::temp_dir().join(format!("quickspark-desktop-{}", std::process::id()));
         let desktop = root.join("移动的桌面");
-        fs::create_dir_all(&desktop).unwrap();
+        let nested = desktop.join("项目文件夹");
+        fs::create_dir_all(&nested).unwrap();
         let path = desktop.join("审计示例.lnk");
+        let nested_exe = nested.join("build-output.exe");
         fs::write(&path, []).unwrap();
+        fs::write(&nested_exe, []).unwrap();
         let roots = shortcut_roots(|id| {
             Some(if id.data1 == FOLDERID_Desktop.data1 {
                 desktop.clone()
@@ -499,13 +529,24 @@ mod tests {
             })
         });
         let mut entries = Vec::new();
-        for directory in roots {
-            collect_dir(&directory, &mut entries, &[], &[], 8);
+        for (directory, max_depth) in roots {
+            collect_dir(&directory, &mut entries, &[], &[], max_depth);
         }
         assert_eq!(entries.len(), 1);
         assert!(matches!(&entries[0].target, EntryTarget::File(found) if found == &path));
-        fs::remove_file(path).unwrap();
-        fs::remove_dir(desktop).unwrap();
-        fs::remove_dir(root).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn packaged_apps_respect_system_setting_filter_unless_explicitly_allowed() {
+        let raw = "设置\twindows.immersivecontrolpanel_cw5n1h2txyewy!microsoft.windows.immersivecontrolpanel\nCalculator\tMicrosoft.WindowsCalculator_8wekyb3d8bbwe!App\n";
+        let mut entries = Vec::new();
+        collect_packaged_entries(raw, &mut entries, &[], &[]);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "Calculator");
+
+        let mut allowed_entries = Vec::new();
+        collect_packaged_entries(raw, &mut allowed_entries, &[], &["设置".to_owned()]);
+        assert_eq!(allowed_entries.len(), 2);
     }
 }

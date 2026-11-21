@@ -270,6 +270,10 @@ fn migrate_legacy_data_dirs(old: &Path, new: &Path) -> bool {
     )
 }
 
+fn strip_bom(text: &str) -> &str {
+    text.strip_prefix('\u{feff}').unwrap_or(text)
+}
+
 fn load_patterns(file_name: &str, initial_comment: &str) -> Vec<String> {
     let Some(path) = data_file(file_name) else {
         return Vec::new();
@@ -283,7 +287,8 @@ fn load_patterns(file_name: &str, initial_comment: &str) -> Vec<String> {
     fs::read_to_string(path)
         .ok()
         .map(|text| {
-            text.lines()
+            strip_bom(&text)
+                .lines()
                 .map(str::trim)
                 .filter(|line| !line.is_empty() && !line.starts_with('#'))
                 .map(str::to_lowercase)
@@ -314,7 +319,7 @@ pub(crate) fn load_usage_from(path: &Path) -> HashMap<String, Usage> {
     let Ok(text) = fs::read_to_string(path) else {
         return usage;
     };
-    for line in text.lines() {
+    for line in strip_bom(&text).lines() {
         let mut fields = line.split('\t');
         let (Some(key), Some(count), Some(last)) = (fields.next(), fields.next(), fields.next())
         else {
@@ -379,7 +384,7 @@ fn write_atomic(path: &Path, contents: &str) -> bool {
 pub(crate) fn load_light_theme() -> bool {
     data_file("theme.txt")
         .and_then(|path| fs::read_to_string(path).ok())
-        .is_some_and(|value| value.trim() == "light")
+        .is_some_and(|value| strip_bom(&value).trim() == "light")
 }
 
 pub(crate) fn save_theme(light: bool) -> bool {
@@ -394,7 +399,7 @@ pub(crate) fn load_settings() -> Settings {
     if let Some(path) = data_file("settings.txt")
         && let Ok(text) = fs::read_to_string(path)
     {
-        for line in text.lines() {
+        for line in strip_bom(&text).lines() {
             let Some((key, value)) = line.split_once('=') else {
                 continue;
             };
@@ -578,7 +583,7 @@ fn ensure_ai_thinking_settings(path: &Path) {
     let mut has_reasoning_effort = false;
     for line in original.split_inclusive('\n') {
         if let Some((key, value)) = line.split_once('=') {
-            match key.trim() {
+            match strip_bom(key).trim() {
                 "system_prompt" if value.trim() == LEGACY_SYSTEM_PROMPT => {
                     text.push_str(&line.replacen(LEGACY_SYSTEM_PROMPT, DEFAULT_SYSTEM_PROMPT, 1));
                     continue;
@@ -608,14 +613,18 @@ fn ensure_ai_thinking_settings(path: &Path) {
 }
 
 pub(crate) fn load_ai_config() -> AiConfig {
-    let mut config = AiConfig::default();
-    let Some(path) = ai_config_file() else {
-        return config;
+    let Some(path) = data_file("ai-settings.txt") else {
+        return AiConfig::default();
     };
+    load_ai_config_from(&path)
+}
+
+pub(crate) fn load_ai_config_from(path: &Path) -> AiConfig {
+    let mut config = AiConfig::default();
     let Ok(text) = fs::read_to_string(path) else {
         return config;
     };
-    for line in text.lines().map(str::trim) {
+    for line in strip_bom(&text).lines().map(str::trim) {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
@@ -657,7 +666,8 @@ pub(crate) fn load_pinned() -> HashSet<String> {
     data_file("pinned.txt")
         .and_then(|path| fs::read_to_string(path).ok())
         .map(|text| {
-            text.lines()
+            strip_bom(&text)
+                .lines()
                 .map(str::trim)
                 .filter(|line| !line.is_empty())
                 .map(str::to_owned)
@@ -762,5 +772,19 @@ mod tests {
         assert!(new.join(LEGACY_MIGRATION_MARKER).is_file());
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn loads_ai_config_with_utf8_bom_on_first_line() {
+        let path = std::env::temp_dir().join(format!("quickspark-bom-{}.txt", std::process::id()));
+        fs::write(
+            &path,
+            "\u{feff}api_url=https://example.com/v1/chat/completions\r\nmodel=demo-model\r\n",
+        )
+        .unwrap();
+        let config = super::load_ai_config_from(&path);
+        assert_eq!(config.api_url, "https://example.com/v1/chat/completions");
+        assert_eq!(config.model, "demo-model");
+        fs::remove_file(path).unwrap();
     }
 }

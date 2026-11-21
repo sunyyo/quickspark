@@ -1,7 +1,8 @@
 use std::{
+    cell::RefCell,
     collections::HashSet,
     path::PathBuf,
-    ptr::{null, null_mut},
+    ptr::{NonNull, null, null_mut},
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -288,13 +289,15 @@ struct ReplyContext {
 
 struct EverythingClient {
     hwnd: HWND,
-    reply: Box<ReplyContext>,
+    // Heap-owned via Box::into_raw and accessed through RefCell so Win32
+    // callbacks on the same thread never alias a live Box/&mut reference.
+    reply: NonNull<RefCell<ReplyContext>>,
     next_reply_token: u32,
 }
 
 impl EverythingClient {
     fn new() -> Option<Self> {
-        let mut reply = Box::<ReplyContext>::default();
+        let reply = Box::into_raw(Box::new(RefCell::new(ReplyContext::default())));
         let class_name = wide(REPLY_WINDOW_CLASS);
         let instance = unsafe { GetModuleHandleW(null()) };
         let window_class = WNDCLASSW {
@@ -323,20 +326,25 @@ impl EverythingClient {
             )
         };
         if hwnd.is_null() {
+            unsafe {
+                drop(Box::from_raw(reply));
+            }
             return None;
         }
         unsafe {
-            SetWindowLongPtrW(
-                hwnd,
-                GWLP_USERDATA,
-                reply.as_mut() as *mut ReplyContext as isize,
-            );
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, reply as isize);
         }
+        let reply = NonNull::new(reply)?;
         Some(Self {
             hwnd,
             reply,
             next_reply_token: REPLY_TOKEN_START,
         })
+    }
+
+    fn with_reply<R>(&self, access: impl FnOnce(&mut ReplyContext) -> R) -> Option<R> {
+        let mut reply = unsafe { self.reply.as_ref() }.try_borrow_mut().ok()?;
+        Some(access(&mut reply))
     }
 
     fn query(&mut self, terms: &str, limit: usize) -> Result<Vec<FileEntry>, EverythingError> {
@@ -348,8 +356,10 @@ impl EverythingClient {
 
         let reply_token = self.next_reply_token;
         self.next_reply_token = self.next_reply_token.wrapping_add(1).max(REPLY_TOKEN_START);
-        self.reply.expected_token = reply_token as usize;
-        self.reply.outcome = None;
+        let _ = self.with_reply(|reply| {
+            reply.expected_token = reply_token as usize;
+            reply.outcome = None;
+        });
 
         let mut query = build_everything_query(
             self.hwnd as usize as u32,
@@ -375,22 +385,30 @@ impl EverythingClient {
             )
         };
         if sent == 0 || message_result == 0 {
-            self.reply.expected_token = 0;
+            let _ = self.with_reply(|reply| reply.expected_token = 0);
             return Err(EverythingError::QueryRejected);
         }
 
         let deadline = Instant::now() + EVERYTHING_REPLY_TIMEOUT;
-        while self.reply.outcome.is_none() && Instant::now() < deadline {
+        while self
+            .with_reply(|reply| reply.outcome.is_none())
+            .unwrap_or(false)
+            && Instant::now() < deadline
+        {
             self.pump_messages();
-            if self.reply.outcome.is_none() {
+            if self
+                .with_reply(|reply| reply.outcome.is_none())
+                .unwrap_or(false)
+            {
                 thread::sleep(Duration::from_millis(1));
             }
         }
-        self.reply.expected_token = 0;
-        self.reply
-            .outcome
-            .take()
-            .unwrap_or(Err(EverythingError::ReplyTimedOut))
+        self.with_reply(|reply| {
+            reply.expected_token = 0;
+            reply.outcome.take()
+        })
+        .flatten()
+        .unwrap_or(Err(EverythingError::ReplyTimedOut))
     }
 
     fn pump_messages(&self) {
@@ -407,7 +425,9 @@ impl EverythingClient {
 impl Drop for EverythingClient {
     fn drop(&mut self) {
         unsafe {
+            SetWindowLongPtrW(self.hwnd, GWLP_USERDATA, 0);
             DestroyWindow(self.hwnd);
+            drop(Box::from_raw(self.reply.as_ptr()));
         }
     }
 }
@@ -419,27 +439,32 @@ unsafe extern "system" fn everything_reply_window_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     if message == WM_COPYDATA && lparam != 0 {
-        let context = unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut ReplyContext };
+        let context =
+            unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *const RefCell<ReplyContext> };
         let copy_data = unsafe { &*(lparam as *const COPYDATASTRUCT) };
-        if !context.is_null()
-            && unsafe { (*context).expected_token } != 0
-            && copy_data.dwData == unsafe { (*context).expected_token }
-        {
-            let outcome = if copy_data.lpData.is_null() {
-                Err(EverythingError::InvalidReply)
-            } else {
-                let bytes = unsafe {
-                    std::slice::from_raw_parts(
-                        copy_data.lpData.cast::<u8>(),
-                        copy_data.cbData as usize,
-                    )
+        if !context.is_null() {
+            let expected_token = unsafe { &*context }
+                .try_borrow()
+                .ok()
+                .map(|reply| reply.expected_token)
+                .unwrap_or(0);
+            if expected_token != 0 && copy_data.dwData == expected_token {
+                let outcome = if copy_data.lpData.is_null() {
+                    Err(EverythingError::InvalidReply)
+                } else {
+                    let bytes = unsafe {
+                        std::slice::from_raw_parts(
+                            copy_data.lpData.cast::<u8>(),
+                            copy_data.cbData as usize,
+                        )
+                    };
+                    parse_everything_reply(bytes)
                 };
-                parse_everything_reply(bytes)
-            };
-            unsafe {
-                (*context).outcome = Some(outcome);
+                if let Ok(mut reply) = unsafe { &*context }.try_borrow_mut() {
+                    reply.outcome = Some(outcome);
+                }
+                return 1;
             }
-            return 1;
         }
     }
     unsafe { DefWindowProcW(hwnd, message, wparam, lparam) }
@@ -612,6 +637,67 @@ mod tests {
         assert_eq!(
             parse_everything_reply(&reply),
             Err(EverythingError::InvalidReply)
+        );
+    }
+
+    #[test]
+    fn native_reply_window_receives_matching_copydata_and_ignores_stale_tokens() {
+        use windows_sys::Win32::{
+            Foundation::LPARAM,
+            System::DataExchange::COPYDATASTRUCT,
+            UI::WindowsAndMessaging::{SendMessageW, WM_COPYDATA},
+        };
+
+        let client = EverythingClient::new().expect("reply window should be created");
+        client
+            .with_reply(|reply| {
+                reply.expected_token = 0x5153_0007;
+                reply.outcome = None;
+            })
+            .unwrap();
+
+        let mut payload = reply_with_paths(&[r"C:\Docs\说明.txt"]);
+        let stale = COPYDATASTRUCT {
+            dwData: 0x5153_0006,
+            cbData: payload.len() as u32,
+            lpData: payload.as_mut_ptr().cast(),
+        };
+        assert_eq!(
+            unsafe {
+                SendMessageW(
+                    client.hwnd,
+                    WM_COPYDATA,
+                    0,
+                    &stale as *const COPYDATASTRUCT as LPARAM,
+                )
+            },
+            0
+        );
+        assert!(client.with_reply(|reply| reply.outcome.is_none()).unwrap());
+
+        let matching = COPYDATASTRUCT {
+            dwData: 0x5153_0007,
+            cbData: payload.len() as u32,
+            lpData: payload.as_mut_ptr().cast(),
+        };
+        assert_eq!(
+            unsafe {
+                SendMessageW(
+                    client.hwnd,
+                    WM_COPYDATA,
+                    0,
+                    &matching as *const COPYDATASTRUCT as LPARAM,
+                )
+            },
+            1
+        );
+        let outcome = client.with_reply(|reply| reply.outcome.take()).unwrap();
+        assert_eq!(
+            outcome,
+            Some(Ok(vec![FileEntry {
+                name: "说明.txt".to_owned(),
+                path: PathBuf::from(r"C:\Docs\说明.txt"),
+            }]))
         );
     }
 

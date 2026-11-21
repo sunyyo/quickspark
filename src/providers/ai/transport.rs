@@ -26,6 +26,7 @@ use crate::{
 use super::{AiResponse, StreamDelta, preview};
 
 const MAX_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
+const MAX_SSE_WIRE_BYTES: usize = 64 * 1024 * 1024;
 const MAX_READ_CHUNK_BYTES: u32 = 64 * 1024;
 
 pub(super) fn request_body(config: &AiConfig, request: &AiRequest) -> Vec<u8> {
@@ -79,14 +80,9 @@ pub(super) fn agent_request_body(config: &AiConfig, system: &str, prompt: &str) 
     if let Some(body) = body.as_object_mut() {
         match config.thinking_mode {
             ThinkingMode::Auto => {}
-            ThinkingMode::Enabled => {
-                body.insert("thinking".to_owned(), json!({ "type": "enabled" }));
-                body.insert(
-                    "reasoning_effort".to_owned(),
-                    json!(config.reasoning_effort.key()),
-                );
-            }
-            ThinkingMode::Disabled => {
+            // Keep the internal JSON routing call fast and bounded even when
+            // full thinking is enabled for the user-facing final answer.
+            ThinkingMode::Enabled | ThinkingMode::Disabled => {
                 body.insert("thinking".to_owned(), json!({ "type": "disabled" }));
             }
         }
@@ -155,7 +151,7 @@ where
     )?;
     let status = response_status(request.handle.0)?;
     if !(200..300).contains(&status) {
-        let response = read_response(request.handle.0)?;
+        let response = read_response(request.handle.0, &context)?;
         let details = api_error_message(&response);
         return Err(if details.is_empty() {
             format!("AI 接口返回 HTTP {status}")
@@ -165,45 +161,85 @@ where
     }
 
     let mut raw_response = Vec::new();
+    let mut wire_bytes = 0usize;
     let mut decoder = SseDecoder::default();
     let mut answer = String::new();
     let mut reasoning = String::new();
     let mut finish_reason = None;
     let mut saw_sse = false;
-    let mut accept = |frames: Vec<StreamFrame>| {
-        for frame in frames {
-            saw_sse = true;
-            match frame {
-                StreamFrame::Reasoning(text) => {
-                    reasoning.push_str(&text);
-                    on_delta(StreamDelta::Reasoning(text));
+    let mut accept =
+        |frames: Vec<StreamFrame>, saw_sse: &mut bool| -> Result<ControlFlow<()>, String> {
+            for frame in frames {
+                *saw_sse = true;
+                match frame {
+                    StreamFrame::Reasoning(text) => {
+                        if answer
+                            .len()
+                            .saturating_add(reasoning.len())
+                            .saturating_add(text.len())
+                            > MAX_RESPONSE_BYTES
+                        {
+                            return Err("AI 响应超过 4 MB 安全上限".to_owned());
+                        }
+                        reasoning.push_str(&text);
+                        on_delta(StreamDelta::Reasoning(text));
+                    }
+                    StreamFrame::Answer(text) => {
+                        if answer
+                            .len()
+                            .saturating_add(reasoning.len())
+                            .saturating_add(text.len())
+                            > MAX_RESPONSE_BYTES
+                        {
+                            return Err("AI 响应超过 4 MB 安全上限".to_owned());
+                        }
+                        answer.push_str(&text);
+                        on_delta(StreamDelta::Answer(text));
+                    }
+                    StreamFrame::FinishReason(reason) => finish_reason = Some(reason),
+                    StreamFrame::Done => return Ok(ControlFlow::Break(())),
                 }
-                StreamFrame::Answer(text) => {
-                    answer.push_str(&text);
-                    on_delta(StreamDelta::Answer(text));
-                }
-                StreamFrame::FinishReason(reason) => finish_reason = Some(reason),
-                StreamFrame::Done => return ControlFlow::Break(()),
             }
-        }
-        ControlFlow::Continue(())
-    };
+            Ok(ControlFlow::Continue(()))
+        };
     let mut done = false;
     read_response_chunks(request.handle.0, |chunk| {
         context.ensure_current()?;
-        let new_len = raw_response
-            .len()
+        wire_bytes = wire_bytes
             .checked_add(chunk.len())
             .ok_or_else(|| "AI 响应过大".to_owned())?;
-        if new_len > MAX_RESPONSE_BYTES {
-            return Err("AI 响应超过 4 MB 安全上限".to_owned());
+        if !saw_sse {
+            let new_len = raw_response
+                .len()
+                .checked_add(chunk.len())
+                .ok_or_else(|| "AI 响应过大".to_owned())?;
+            if new_len > MAX_RESPONSE_BYTES {
+                return Err("AI 响应超过 4 MB 安全上限".to_owned());
+            }
+            raw_response.extend_from_slice(chunk);
+        } else if wire_bytes > MAX_SSE_WIRE_BYTES {
+            return Err("AI 流式响应超过安全传输上限".to_owned());
         }
-        raw_response.extend_from_slice(chunk);
-        let flow = accept(decoder.push(chunk)?);
+        let flow = accept(decoder.push(chunk)?, &mut saw_sse)?;
+        if saw_sse && !raw_response.is_empty() {
+            raw_response.clear();
+            raw_response.shrink_to_fit();
+        }
         done = flow.is_break();
         Ok(flow)
     })?;
-    let done = done || accept(decoder.finish()?).is_break();
+    let mut truncated_tail = false;
+    match decoder.finish() {
+        Ok(frames) => {
+            if accept(frames, &mut saw_sse)?.is_break() {
+                done = true;
+            }
+        }
+        Err(_) if saw_sse && !answer.trim().is_empty() => {
+            truncated_tail = true;
+        }
+        Err(error) => return Err(error),
+    }
     if saw_sse {
         let answer = answer.trim();
         if answer.is_empty() {
@@ -212,14 +248,18 @@ where
             Ok(AiResponse {
                 answer: answer.to_owned(),
                 reasoning,
-                completion: finish_reason
-                    .as_deref()
-                    .map(AiCompletion::from_reason)
-                    .unwrap_or(if done {
-                        AiCompletion::Complete
-                    } else {
-                        AiCompletion::Interrupted
-                    }),
+                completion: if truncated_tail {
+                    AiCompletion::Interrupted
+                } else {
+                    finish_reason
+                        .as_deref()
+                        .map(AiCompletion::from_reason)
+                        .unwrap_or(if done {
+                            AiCompletion::Complete
+                        } else {
+                            AiCompletion::Interrupted
+                        })
+                },
             })
         }
     } else {
@@ -347,9 +387,15 @@ fn post_json(
         )));
     }
     let mut headers = format!("Content-Type: application/json\r\nAccept: {accept}\r\n");
-    if !api_key.trim().is_empty() {
+    let api_key = api_key.trim();
+    if !api_key.is_empty() {
+        if api_key.chars().any(char::is_control) {
+            return Err(format!(
+                "{service_name} API Key 包含无效控制字符，请重新设置"
+            ));
+        }
         headers.push_str("Authorization: Bearer ");
-        headers.push_str(api_key.trim());
+        headers.push_str(api_key);
         headers.push_str("\r\n");
     }
     let headers = wide(&headers);
@@ -398,9 +444,10 @@ fn response_status(request: *mut c_void) -> Result<u32, String> {
     Ok(status)
 }
 
-fn read_response(request: *mut c_void) -> Result<Vec<u8>, String> {
+fn read_response(request: *mut c_void, context: &RequestContext) -> Result<Vec<u8>, String> {
     let mut response = Vec::new();
     read_response_chunks(request, |chunk| {
+        context.ensure_current()?;
         let new_len = response
             .len()
             .checked_add(chunk.len())
@@ -496,6 +543,14 @@ pub(super) struct SseDecoder {
 
 impl SseDecoder {
     pub(super) fn push(&mut self, chunk: &[u8]) -> Result<Vec<StreamFrame>, String> {
+        let new_len = self
+            .pending
+            .len()
+            .checked_add(chunk.len())
+            .ok_or_else(|| "AI 流式单行数据过大".to_owned())?;
+        if new_len > MAX_RESPONSE_BYTES {
+            return Err("AI 流式单行数据超过 4 MB 安全上限".to_owned());
+        }
         self.pending.extend_from_slice(chunk);
         let mut frames = Vec::new();
         while let Some(newline) = self.pending.iter().position(|byte| *byte == b'\n') {

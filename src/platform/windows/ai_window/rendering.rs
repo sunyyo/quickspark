@@ -5,7 +5,7 @@ pub(super) fn rich_edit_available() -> bool {
         .get_or_init(|| unsafe { !LoadLibraryW(wide("Msftedit.dll").as_ptr()).is_null() })
 }
 
-pub(super) unsafe fn render_answer(state: &AnswerWindow) {
+pub(super) unsafe fn render_answer(state: &AnswerWindow, scroll_to_end: bool) {
     let display = answer_display(&state.answer);
     let rendered = render_markdown(&display);
     let end = rendered.text.encode_utf16().count();
@@ -27,8 +27,9 @@ pub(super) unsafe fn render_answer(state: &AnswerWindow) {
             unsafe { apply_markdown_span(state.answer_edit, span, state.colors) };
         }
     }
+    let caret = if scroll_to_end { end } else { 0 };
     unsafe {
-        SendMessageW(state.answer_edit, EM_SETSEL, end, end as LPARAM);
+        SendMessageW(state.answer_edit, EM_SETSEL, caret, caret as LPARAM);
         SendMessageW(state.answer_edit, EM_SCROLLCARET, 0, 0);
         SendMessageW(state.answer_edit, WM_SETREDRAW, 1, 0);
         InvalidateRect(state.answer_edit, null(), 0);

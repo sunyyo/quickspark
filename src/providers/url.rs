@@ -38,9 +38,11 @@ fn direct_url(raw: &str) -> Option<String> {
     let input = raw.trim();
     if input.is_empty()
         || input.chars().count() > MAX_URL_CHARS
-        || input
-            .chars()
-            .any(|character| character.is_whitespace() || character.is_control())
+        || input.chars().any(|character| {
+            character.is_whitespace()
+                || character.is_control()
+                || matches!(character, '"' | '<' | '>')
+        })
     {
         return None;
     }
@@ -191,6 +193,8 @@ mod tests {
             "https://example.com:70000",
             "https://-example.com",
             "https://999.999.999.999",
+            "https://example.com/path\"quote",
+            "https://example.com/<tag>",
             "file:///C:/Windows",
         ] {
             assert_eq!(direct_url(input), None, "unexpected URL match: {input}");

@@ -1,4 +1,9 @@
-use std::{collections::HashSet, fmt::Write, sync::Arc, time::Instant};
+use std::{
+    collections::HashSet,
+    fmt::Write,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use serde_json::Value;
 
@@ -56,27 +61,38 @@ pub(super) fn run(
         generation,
     };
     let started = Instant::now();
-    let (mut sources, warning) =
-        if request.task == AiTask::Question && request.web_search != WebSearchMode::Disabled {
-            research(
-                request,
-                config,
-                &ai_api_key,
-                context.clone(),
-                generation,
-                service,
-                started,
-            )?
-        } else {
-            (Vec::new(), None)
-        };
+    let use_research =
+        request.task == AiTask::Question && request.web_search != WebSearchMode::Disabled;
+    let total_budget = agent_budget(config.timeout_seconds);
+    let (mut sources, warning) = if use_research {
+        research(
+            request,
+            config,
+            &ai_api_key,
+            context.clone(),
+            generation,
+            service,
+            started,
+            total_budget,
+        )?
+    } else {
+        (Vec::new(), None)
+    };
     sources = fit_sources(sources);
-    ensure_active(&context, started)?;
+    if use_research && !sources.is_empty() {
+        ensure_active(&context, started, total_budget)?;
+    } else {
+        context.ensure_current()?;
+    }
 
     let mut final_request = request.clone();
     let mut final_config = config.clone();
-    final_config.timeout_seconds =
-        remaining_timeout_seconds(final_config.timeout_seconds, started)?;
+    final_config.timeout_seconds = final_timeout_seconds(
+        final_config.timeout_seconds,
+        use_research && !sources.is_empty(),
+        started,
+        total_budget,
+    )?;
     if !sources.is_empty() {
         final_request.request_prompt =
             grounded_prompt(&request.request_prompt, &sources, warning.as_deref());
@@ -95,6 +111,7 @@ pub(super) fn run(
     Ok(response)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn research(
     request: &AiRequest,
     config: &AiConfig,
@@ -103,6 +120,7 @@ fn research(
     generation: u64,
     service: &AiService,
     started: Instant,
+    budget: Duration,
 ) -> Result<(Vec<SearchSource>, Option<String>), String> {
     let mut sources = Vec::new();
     let mut source_urls = HashSet::new();
@@ -121,6 +139,7 @@ fn research(
                 &executed_queries,
                 context.clone(),
                 started,
+                budget,
             )? {
                 AgentDecision::Search(queries) => queries,
                 AgentDecision::Answer => return Ok((sources, warning)),
@@ -136,14 +155,14 @@ fn research(
         && executed_queries.len() < MAX_SEARCH_QUERIES
         && sources.len() < MAX_SEARCH_SOURCES
     {
-        ensure_active(&context, started)?;
+        ensure_active(&context, started, budget)?;
         round += 1;
         let remaining_queries = MAX_SEARCH_QUERIES.saturating_sub(executed_queries.len());
         let mut searched_this_round = 0usize;
         let mut last_error = None;
         for query in pending.into_iter().take(remaining_queries) {
-            ensure_active(&context, started)?;
-            let timeout_seconds = remaining_timeout_seconds(20, started)?;
+            ensure_active(&context, started, budget)?;
+            let timeout_seconds = remaining_timeout_seconds(20, started, budget)?;
             let query = normalize_query(&query);
             if query.is_empty() || !executed_keys.insert(query.to_lowercase()) {
                 continue;
@@ -203,6 +222,7 @@ fn research(
             &executed_queries,
             context.clone(),
             started,
+            budget,
         ) {
             Ok(AgentDecision::Search(queries)) => queries,
             Ok(AgentDecision::Answer) => Vec::new(),
@@ -215,6 +235,7 @@ fn research(
     Ok((sources, warning))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decide(
     question: &str,
     config: &AiConfig,
@@ -223,13 +244,14 @@ fn decide(
     executed_queries: &[String],
     context: transport::RequestContext,
     started: Instant,
+    budget: Duration,
 ) -> Result<AgentDecision, String> {
-    ensure_active(&context, started)?;
+    ensure_active(&context, started, budget)?;
     let prompt = controller_input(question, sources, executed_queries);
     let body = transport::agent_request_body(config, CONTROLLER_PROMPT, &prompt);
     let mut planner_config = config.clone();
     planner_config.timeout_seconds =
-        remaining_timeout_seconds(planner_config.timeout_seconds.min(30), started)?;
+        remaining_timeout_seconds(planner_config.timeout_seconds.min(30), started, budget)?;
     let response = transport::winhttp_stream_json(&planner_config, api_key, &body, context, |_| {})
         .map_err(|error| format!("联网规划请求失败：{error}"))?;
     if matches!(
@@ -337,20 +359,51 @@ fn normalize_query(value: &str) -> String {
     output
 }
 
-fn ensure_active(context: &transport::RequestContext, started: Instant) -> Result<(), String> {
+fn agent_budget(configured_timeout_seconds: u32) -> Duration {
+    MAX_AGENT_DURATION.max(Duration::from_secs(u64::from(configured_timeout_seconds)))
+}
+
+fn final_timeout_seconds(
+    configured: u32,
+    used_web_research: bool,
+    started: Instant,
+    budget: Duration,
+) -> Result<u32, String> {
+    if used_web_research {
+        remaining_timeout_seconds(configured, started, budget)
+    } else {
+        Ok(configured.max(5))
+    }
+}
+
+fn ensure_active(
+    context: &transport::RequestContext,
+    started: Instant,
+    budget: Duration,
+) -> Result<(), String> {
     context.ensure_current()?;
-    if started.elapsed() > MAX_AGENT_DURATION {
-        Err("联网问答超过 120 秒总时限；请缩小问题范围后重试".to_owned())
+    if started.elapsed() > budget {
+        Err(format!(
+            "联网问答超过 {} 秒总时限；请缩小问题范围后重试",
+            budget.as_secs()
+        ))
     } else {
         Ok(())
     }
 }
 
-fn remaining_timeout_seconds(configured: u32, started: Instant) -> Result<u32, String> {
-    let remaining = MAX_AGENT_DURATION.saturating_sub(started.elapsed());
+fn remaining_timeout_seconds(
+    configured: u32,
+    started: Instant,
+    budget: Duration,
+) -> Result<u32, String> {
+    let remaining = budget.saturating_sub(started.elapsed());
     let remaining_seconds = remaining.as_secs();
     if remaining_seconds < 5 {
-        return Err("联网问答超过 120 秒总时限；请缩小问题范围后重试".to_owned());
+        return Err(format!(
+            "联网问答超过 {} 秒总时限；请缩小问题范围后重试",
+            budget.as_secs()
+        ));
     }
     Ok(configured
         .max(5)
@@ -407,7 +460,9 @@ fn grounded_prompt(question: &str, sources: &[SearchSource], warning: Option<&st
 
 #[cfg(test)]
 mod tests {
-    use super::{AgentDecision, parse_agent_decision};
+    use std::time::{Duration, Instant};
+
+    use super::{AgentDecision, agent_budget, final_timeout_seconds, parse_agent_decision};
 
     #[test]
     fn parses_agent_decisions_and_limits_queries() {
@@ -427,5 +482,17 @@ mod tests {
             ])
         );
         assert!(parse_agent_decision(r#"{"action":"search","queries":[]}"#).is_err());
+    }
+
+    #[test]
+    fn preserves_long_configured_timeouts_without_silent_120s_clamping() {
+        let started = Instant::now();
+        assert_eq!(agent_budget(60), Duration::from_secs(120));
+        assert_eq!(agent_budget(300), Duration::from_secs(300));
+        assert_eq!(
+            final_timeout_seconds(300, false, started, agent_budget(300)).unwrap(),
+            300
+        );
+        assert!(final_timeout_seconds(300, true, started, agent_budget(300)).unwrap() >= 299);
     }
 }

@@ -203,13 +203,17 @@ fn render_table_row(line: &str, builder: &mut Builder) {
 }
 
 fn render_inline(input: &str, builder: &mut Builder) {
-    let mut rest = input;
-    while !rest.is_empty() {
+    let mut offset = 0usize;
+    while offset < input.len() {
+        let prev = input[..offset].chars().next_back();
+        let rest = &input[offset..];
+
         if let Some(escaped) = rest.strip_prefix('\\')
             && let Some(character) = escaped.chars().next()
+            && character.is_ascii_punctuation()
         {
             builder.push(&character.to_string());
-            rest = &escaped[character.len_utf8()..];
+            offset += 1 + character.len_utf8();
             continue;
         }
 
@@ -225,7 +229,7 @@ fn render_inline(input: &str, builder: &mut Builder) {
                 builder.push(")");
             }
             builder.span(start, MarkdownStyle::Link);
-            rest = remaining;
+            offset = input.len() - remaining.len();
             continue;
         }
 
@@ -240,15 +244,17 @@ fn render_inline(input: &str, builder: &mut Builder) {
                 builder.push(")");
             }
             builder.span(start, MarkdownStyle::Link);
-            rest = remaining;
+            offset = input.len() - remaining.len();
             continue;
         }
 
-        if let Some((inner, remaining)) = delimited(rest, "**").or_else(|| delimited(rest, "__")) {
+        if let Some((inner, remaining)) =
+            delimited(rest, "**").or_else(|| delimited_underscore(rest, "__", prev))
+        {
             let start = builder.position();
             render_inline(inner, builder);
             builder.span(start, MarkdownStyle::Bold);
-            rest = remaining;
+            offset = input.len() - remaining.len();
             continue;
         }
 
@@ -256,7 +262,7 @@ fn render_inline(input: &str, builder: &mut Builder) {
             let start = builder.position();
             render_inline(inner, builder);
             builder.span(start, MarkdownStyle::Strike);
-            rest = remaining;
+            offset = input.len() - remaining.len();
             continue;
         }
 
@@ -264,15 +270,17 @@ fn render_inline(input: &str, builder: &mut Builder) {
             let start = builder.position();
             builder.push(inner);
             builder.span(start, MarkdownStyle::Code);
-            rest = remaining;
+            offset = input.len() - remaining.len();
             continue;
         }
 
-        if let Some((inner, remaining)) = delimited(rest, "*").or_else(|| delimited(rest, "_")) {
+        if let Some((inner, remaining)) =
+            delimited(rest, "*").or_else(|| delimited_underscore(rest, "_", prev))
+        {
             let start = builder.position();
             render_inline(inner, builder);
             builder.span(start, MarkdownStyle::Italic);
-            rest = remaining;
+            offset = input.len() - remaining.len();
             continue;
         }
 
@@ -281,13 +289,13 @@ fn render_inline(input: &str, builder: &mut Builder) {
             .or_else(|| rest.strip_prefix("<br/>"))
         {
             builder.line_break();
-            rest = remaining;
+            offset = input.len() - remaining.len();
             continue;
         }
 
         let character = rest.chars().next().expect("rest is not empty");
         builder.push(&character.to_string());
-        rest = &rest[character.len_utf8()..];
+        offset += character.len_utf8();
     }
 }
 
@@ -298,6 +306,35 @@ fn delimited<'a>(input: &'a str, delimiter: &str) -> Option<(&'a str, &'a str)> 
         return None;
     }
     Some((&after[..closing], &after[closing + delimiter.len()..]))
+}
+
+fn delimited_underscore<'a>(
+    input: &'a str,
+    delimiter: &str,
+    previous: Option<char>,
+) -> Option<(&'a str, &'a str)> {
+    if previous.is_some_and(char::is_alphanumeric) {
+        return None;
+    }
+    let after = input.strip_prefix(delimiter)?;
+    if after.chars().next().is_none_or(char::is_whitespace) {
+        return None;
+    }
+    let mut search_from = 0usize;
+    while let Some(relative) = after[search_from..].find(delimiter) {
+        let closing = search_from + relative;
+        let next_start = closing + delimiter.len();
+        let inner = &after[..closing];
+        let remaining = &after[next_start..];
+        let valid_close = closing > 0
+            && !inner.chars().next_back().is_some_and(char::is_whitespace)
+            && !remaining.chars().next().is_some_and(char::is_alphanumeric);
+        if valid_close {
+            return Some((inner, remaining));
+        }
+        search_from = closing + 1;
+    }
+    None
 }
 
 fn markdown_link(input: &str) -> Option<(&str, &str, &str)> {
@@ -372,5 +409,32 @@ mod tests {
             .find(|span| span.style == MarkdownStyle::Bold)
             .unwrap();
         assert_eq!((bold.start, bold.end), (3, 4));
+    }
+
+    #[test]
+    fn preserves_windows_paths_and_snake_case_identifiers() {
+        let rendered = render_markdown(
+            r"路径：C:\Users\Alice\AppData\Roaming\QuickSpark\ai-settings.txt，配置 api_url 和 max_tokens，以及 foo_bar_baz",
+        );
+        assert_eq!(
+            rendered.text,
+            r"路径：C:\Users\Alice\AppData\Roaming\QuickSpark\ai-settings.txt，配置 api_url 和 max_tokens，以及 foo_bar_baz"
+        );
+        assert!(rendered.spans.is_empty());
+
+        let emphasized = render_markdown(r"\_字面\_ 和 _斜体_ 以及 __加粗__");
+        assert_eq!(emphasized.text, "_字面_ 和 斜体 以及 加粗");
+        assert!(
+            emphasized
+                .spans
+                .iter()
+                .any(|span| span.style == MarkdownStyle::Italic)
+        );
+        assert!(
+            emphasized
+                .spans
+                .iter()
+                .any(|span| span.style == MarkdownStyle::Bold)
+        );
     }
 }

@@ -27,10 +27,10 @@ use windows_sys::Win32::{
         Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute},
         Gdi::{
             BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_WINDOW, CreateFontW,
-            CreatePen, CreateSolidBrush, DEFAULT_CHARSET, DT_END_ELLIPSIS, DT_LEFT, DT_RIGHT,
-            DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FF_DONTCARE, FW_NORMAL,
-            FillRect, GetMonitorInfoW, GetStockObject, HBRUSH, HFONT, InvalidateRect, LineTo,
-            MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, MoveToEx, NULL_PEN,
+            CreatePen, CreateSolidBrush, DEFAULT_CHARSET, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
+            DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FF_DONTCARE,
+            FW_NORMAL, FillRect, GetMonitorInfoW, GetStockObject, HBRUSH, HFONT, InvalidateRect,
+            LineTo, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, MoveToEx, NULL_PEN,
             OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, RoundRect, SelectObject, SetBkColor,
             SetBkMode, SetTextColor, TRANSPARENT, UpdateWindow,
         },
@@ -121,6 +121,7 @@ struct App {
     ai_window: HWND,
     ai_generation: u64,
     indexing: bool,
+    modal_depth: u32,
     index_tx: Sender<IndexResult>,
     index_rx: Receiver<IndexResult>,
 }
@@ -312,10 +313,12 @@ unsafe fn execute_action(hwnd: HWND, action: Action) {
             app_id,
             usage_key: key,
         } => {
-            let parameters = format!("shell:AppsFolder\\{app_id}");
-            let launched = windows_program("explorer.exe").is_some_and(|explorer| unsafe {
-                shell_execute(hwnd, "open", &explorer, Some(&parameters))
-            });
+            let launched = (!app_id.contains('"'))
+                .then(|| format!("\"shell:AppsFolder\\{app_id}\""))
+                .zip(windows_program("explorer.exe"))
+                .is_some_and(|(parameters, explorer)| unsafe {
+                    shell_execute(hwnd, "open", &explorer, Some(&parameters))
+                });
             if !launched {
                 unsafe { show_action_error(hwnd, "无法启动该系统应用。") };
             } else {
@@ -481,6 +484,7 @@ unsafe fn execute_action(hwnd: HWND, action: Action) {
             return;
         }
         Action::ConfigureAiKey => {
+            let _modal = unsafe { begin_modal(hwnd) };
             match prompt_ai_api_key(hwnd, &storage::load_ai_config().api_url) {
                 Ok(ApiKeyPromptResult::Saved) => unsafe {
                     MessageBoxW(
@@ -505,6 +509,7 @@ unsafe fn execute_action(hwnd: HWND, action: Action) {
             return;
         }
         Action::ConfigureTavilyKey => {
+            let _modal = unsafe { begin_modal(hwnd) };
             match prompt_tavily_api_key(hwnd) {
                 Ok(ApiKeyPromptResult::Saved) => unsafe {
                     MessageBoxW(
@@ -549,7 +554,31 @@ unsafe fn execute_action(hwnd: HWND, action: Action) {
     unsafe { ShowWindow(hwnd, SW_HIDE) };
 }
 
+struct ModalGuard {
+    hwnd: HWND,
+}
+
+impl Drop for ModalGuard {
+    fn drop(&mut self) {
+        let _ = unsafe {
+            with_app_mut(self.hwnd, |state| {
+                state.modal_depth = state.modal_depth.saturating_sub(1);
+            })
+        };
+    }
+}
+
+unsafe fn begin_modal(hwnd: HWND) -> ModalGuard {
+    let _ = unsafe {
+        with_app_mut(hwnd, |state| {
+            state.modal_depth = state.modal_depth.saturating_add(1);
+        })
+    };
+    ModalGuard { hwnd }
+}
+
 unsafe fn show_action_error(hwnd: HWND, message: &str) {
+    let _modal = unsafe { begin_modal(hwnd) };
     unsafe {
         MessageBoxW(
             hwnd,
@@ -903,6 +932,7 @@ unsafe fn show_launcher(hwnd: HWND) {
         };
         dpi_x = current_dpi;
     }
+    dpi_x = dpi_x.max(96);
     unsafe { apply_dpi(hwnd, dpi_x) };
     let dpi = dpi_x;
     let width = px(WIDTH, dpi);
@@ -968,6 +998,7 @@ unsafe fn show_tray_menu(hwnd: HWND) {
         GetCursorPos(&mut point);
         SetForegroundWindow(hwnd);
         TrackPopupMenu(menu, TPM_RIGHTBUTTON, point.x, point.y, 0, hwnd, null());
+        PostMessageW(hwnd, WM_NULL, 0, 0);
         DestroyMenu(menu);
     }
 }
@@ -1165,8 +1196,9 @@ unsafe fn execute_system_command(hwnd: HWND, command: SystemCommand) -> bool {
         SystemCommand::Shutdown => Some("确定要关闭电脑吗？请先保存正在进行的工作。"),
         SystemCommand::Restart => Some("确定要重新启动电脑吗？请先保存正在进行的工作。"),
     };
-    if let Some(message) = confirmation
-        && unsafe {
+    if let Some(message) = confirmation {
+        let _modal = unsafe { begin_modal(hwnd) };
+        if unsafe {
             MessageBoxW(
                 hwnd,
                 wide(message).as_ptr(),
@@ -1174,8 +1206,9 @@ unsafe fn execute_system_command(hwnd: HWND, command: SystemCommand) -> bool {
                 MB_YESNO | MB_ICONWARNING | MB_DEFBUTTON2,
             )
         } != IDYES
-    {
-        return false;
+        {
+            return false;
+        }
     }
 
     let succeeded = match command {
@@ -1206,7 +1239,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
     }
     match msg {
         WM_CREATE => {
-            let dpi = unsafe { GetDpiForWindow(hwnd) };
+            let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
             let light_theme = load_light_theme();
             let mut settings = load_settings();
             let colors = theme(light_theme);
@@ -1391,6 +1424,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                 ai_window: null_mut(),
                 ai_generation: 0,
                 indexing: false,
+                modal_depth: 0,
                 index_tx,
                 index_rx,
             }));
@@ -1449,14 +1483,17 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                     let _ =
                         unsafe { with_app_mut(hwnd, |state| state.providers.register(provider)) };
                 }
-                Ok(Err(_)) => unsafe {
-                    MessageBoxW(
-                        hwnd,
-                        wide("刷新应用索引时发生内部错误。现有搜索结果将继续保留，您可以稍后从托盘菜单重试。").as_ptr(),
-                        wide("QuickSpark").as_ptr(),
-                        MB_OK | MB_ICONWARNING,
-                    );
-                },
+                Ok(Err(_)) => {
+                    let _modal = unsafe { begin_modal(hwnd) };
+                    unsafe {
+                        MessageBoxW(
+                            hwnd,
+                            wide("刷新应用索引时发生内部错误。现有搜索结果将继续保留，您可以稍后从托盘菜单重试。").as_ptr(),
+                            wide("QuickSpark").as_ptr(),
+                            MB_OK | MB_ICONWARNING,
+                        );
+                    }
+                }
                 Err(_) => {}
             }
             unsafe { refresh(hwnd) };
@@ -1559,7 +1596,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             0
         }
         WM_DPICHANGED => {
-            let dpi = (w & 0xffff) as u32;
+            let dpi = ((w & 0xffff) as u32).max(96);
             let rect = unsafe { &*(l as *const RECT) };
             unsafe {
                 apply_dpi(hwnd, dpi);
@@ -1679,7 +1716,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                     let shortcut = (draw.itemID < VISIBLE_RESULT_COUNT as u32)
                         .then(|| wide(&format!("Alt+{}", draw.itemID + 1)));
                     unsafe {
-                        SelectObject(draw.hDC, font as _);
+                        let old_font = SelectObject(draw.hDC, font as _);
                         SetBkMode(draw.hDC, TRANSPARENT as i32);
                         SetTextColor(draw.hDC, if selected { colors.text } else { colors.dim });
                         DrawTextW(
@@ -1687,7 +1724,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                             name.as_ptr(),
                             -1,
                             &mut name_rect,
-                            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+                            DT_LEFT | DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
                         );
                         if let Some(shortcut) = shortcut {
                             SelectObject(draw.hDC, shortcut_font as _);
@@ -1697,9 +1734,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                                 shortcut.as_ptr(),
                                 -1,
                                 &mut shortcut_rect,
-                                DT_RIGHT | DT_SINGLELINE | DT_VCENTER,
+                                DT_RIGHT | DT_SINGLELINE | DT_VCENTER | DT_NOPREFIX,
                             );
                         }
+                        SelectObject(draw.hDC, old_font);
                     }
                 }
             }
@@ -1773,7 +1811,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             0
         }
         WM_ACTIVATE => {
-            if (w & 0xffff) as u32 == WA_INACTIVE {
+            let in_modal =
+                unsafe { with_app(hwnd, |state| state.modal_depth > 0) }.unwrap_or(false);
+            if !in_modal && (w & 0xffff) as u32 == WA_INACTIVE {
                 unsafe { ShowWindow(hwnd, SW_HIDE) };
             }
             0
@@ -1816,7 +1856,6 @@ fn main() {
         if taskbar_message != 0 {
             let _ = TASKBAR_CREATED.set(taskbar_message);
         }
-        migrate_legacy_data();
         let mutex_name = wide("Local\\QuickSpark.SingleInstance");
         let instance_mutex = CreateMutexW(null(), 0, mutex_name.as_ptr());
         if instance_mutex.is_null() {
@@ -1830,6 +1869,7 @@ fn main() {
             CloseHandle(instance_mutex);
             return;
         }
+        migrate_legacy_data();
         let dpi = GetDpiForSystem();
         let instance: HINSTANCE = GetModuleHandleW(null());
         let class = wide("QuickSparkWindow");

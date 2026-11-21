@@ -535,6 +535,7 @@ fn background_refresh_and_shortcuts_respect_the_current_result_and_window() {
         ai_window: null_mut(),
         ai_generation: 0,
         indexing: true,
+        modal_depth: 0,
         index_tx,
         index_rx,
     });
@@ -570,5 +571,63 @@ fn background_refresh_and_shortcuts_respect_the_current_result_and_window() {
         close_ai_answer(answer);
         SetWindowLongPtrW(parent, GWLP_USERDATA, 0);
         DestroyWindow(parent);
+    }
+}
+
+#[test]
+fn modal_dialogs_prevent_deactivate_from_hiding_the_launcher() {
+    use super::*;
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WS_EX_TOOLWINDOW,
+            wide("STATIC").as_ptr(),
+            null(),
+            WS_POPUP | WS_VISIBLE,
+            0,
+            0,
+            100,
+            100,
+            null_mut(),
+            null_mut(),
+            GetModuleHandleW(null()),
+            null(),
+        )
+    };
+    assert!(!hwnd.is_null());
+    let (index_tx, index_rx) = mpsc::channel();
+    let state = RefCell::new(App {
+        edit: null_mut(),
+        list: null_mut(),
+        results: Vec::new(),
+        providers: ProviderRegistry::new(),
+        font: null_mut(),
+        shortcut_font: null_mut(),
+        background: null_mut(),
+        dpi: 96,
+        light_theme: true,
+        usage: HashMap::new(),
+        pinned: HashSet::new(),
+        settings: Settings::default(),
+        hotkey_registered: false,
+        ai_service: AiService::new(hwnd as usize, AI_READY),
+        ai_window: null_mut(),
+        ai_generation: 0,
+        indexing: false,
+        modal_depth: 0,
+        index_tx,
+        index_rx,
+    });
+    unsafe {
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, &state as *const AppCell as isize);
+        assert_ne!(IsWindowVisible(hwnd), 0);
+        {
+            let _modal = begin_modal(hwnd);
+            wnd_proc(hwnd, WM_ACTIVATE, WA_INACTIVE as WPARAM, 0);
+            assert_ne!(IsWindowVisible(hwnd), 0);
+        }
+        wnd_proc(hwnd, WM_ACTIVATE, WA_INACTIVE as WPARAM, 0);
+        assert_eq!(IsWindowVisible(hwnd), 0);
+        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+        DestroyWindow(hwnd);
     }
 }

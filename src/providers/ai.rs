@@ -12,7 +12,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::PostMessageW;
 use crate::{
     model::{Action, AiCompletion, AiRequest, AiTask, Query, ResultItem, WebSearchMode},
     platform::windows::{ai_api_key_exists, tavily_api_key_exists},
-    storage::{AiConfig, ai_config_file, load_ai_config},
+    storage::{AiConfig, ai_config_file, load_ai_config, load_ai_config_from},
 };
 
 use super::{Provider, ProviderContext, ProviderOutput};
@@ -482,10 +482,10 @@ impl AiProvider {
 }
 
 fn ai_settings() -> ProviderOutput {
-    let config = load_ai_config();
     let Some(path) = ai_config_file() else {
         return message("无法创建 AI 配置文件", Vec::new());
     };
+    let config = load_ai_config_from(&path);
     let path_action = Action::OpenPath { path };
     ProviderOutput {
         results: vec![

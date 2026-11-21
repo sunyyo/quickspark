@@ -350,3 +350,69 @@ fn cached_answers_keep_their_status_and_multiline_rich_edit_styles() {
         assert!(!bold_at(6));
     }
 }
+
+#[test]
+fn answer_window_clamps_to_monitor_work_area_and_handles_dpi_and_empty_copy() {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        GWL_STYLE, GetWindowLongW, SendMessageW, WM_DPICHANGED,
+    };
+
+    let work = super::RECT {
+        left: 0,
+        top: 0,
+        right: 1920,
+        bottom: 1020,
+    };
+    let owner = super::RECT {
+        left: 495,
+        top: 187,
+        right: 1425,
+        bottom: 646,
+    };
+    let (x, y, width, height) = super::clamp_window_rect(owner, work, 1290, 930);
+    assert!(x >= work.left && x + width <= work.right);
+    assert!(y >= work.top && y + height <= work.bottom);
+
+    let window =
+        super::show_ai_stream(std::ptr::null_mut(), "A & B", 0, 0, 1, true).expect("answer window");
+    let _cleanup = AnswerWindowGuard(window);
+    let (old_hint_font, prompt_style) = inspect(window, |state| {
+        assert!(state.thinking_started.is_none());
+        let style = unsafe { GetWindowLongW(state.prompt, GWL_STYLE) } as u32;
+        (state.hint_font, style)
+    });
+    assert_ne!(prompt_style & super::SS_NOPREFIX, 0);
+
+    // Copying before any answer arrives should not change the button label.
+    super::copy_answer(window, false);
+    inspect(window, |state| {
+        assert_eq!(control_text(state.copy_button), "复制回答");
+    });
+
+    // Reasoning timer starts when reasoning actually arrives.
+    assert!(super::append_ai_reasoning(window, "开始思考"));
+    inspect(window, |state| {
+        assert!(state.thinking_started.is_some());
+    });
+
+    // WM_DPICHANGED should recreate fonts and update the shared paint snapshot.
+    let suggested = super::RECT {
+        left: 100,
+        top: 100,
+        right: 1100,
+        bottom: 800,
+    };
+    let new_dpi = 144usize;
+    unsafe {
+        SendMessageW(
+            window,
+            WM_DPICHANGED,
+            (new_dpi << 16) | new_dpi,
+            &suggested as *const super::RECT as isize,
+        );
+    }
+    let shared = super::answer_window_state(window).unwrap();
+    let new_hint_font = inspect(window, |state| state.hint_font);
+    assert_ne!(new_hint_font, old_hint_font);
+    assert_eq!(shared.paint.hint_font.get(), new_hint_font);
+}
