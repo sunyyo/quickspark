@@ -28,7 +28,7 @@ pub(crate) fn copy_text(owner: HWND, text: &str) -> bool {
         return false;
     }
 
-    let encoded = text.encode_utf16().chain(Some(0)).collect::<Vec<_>>();
+    let encoded = super::wide(text);
     let byte_count = encoded.len() * std::mem::size_of::<u16>();
     let memory = unsafe { GlobalAlloc(GMEM_MOVEABLE, byte_count) };
     if memory.is_null() {

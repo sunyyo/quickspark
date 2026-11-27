@@ -24,6 +24,10 @@ impl ParsedUrl {
         format!("{scheme}://{host}:{}", self.port)
     }
 
+    pub(crate) fn is_loopback(&self) -> bool {
+        is_loopback_host(&self.host)
+    }
+
     pub(crate) fn parse(url: &str) -> Result<Self, String> {
         let url = url.trim();
         if url.chars().any(char::is_control) {

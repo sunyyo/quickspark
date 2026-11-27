@@ -1,21 +1,24 @@
-pub(crate) mod ai;
+mod ai;
 pub(crate) mod applications;
-pub(crate) mod calculator;
-pub(crate) mod commands;
-pub(crate) mod converter;
-pub(crate) mod drive;
-pub(crate) mod file_search;
-pub(crate) mod help;
-pub(crate) mod settings;
-pub(crate) mod system;
-pub(crate) mod url;
+mod calculator;
+mod commands;
+mod converter;
+mod drive;
+mod file_search;
+mod help;
+mod settings;
+mod system;
+mod url;
 pub(crate) mod web_search;
-pub(crate) mod window_switcher;
+mod window_switcher;
 
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Mutex, MutexGuard, PoisonError},
+};
 
 use crate::{
-    model::{Query, ResultItem, Usage},
+    model::{Action, Query, ResultItem, Usage},
     storage::Settings,
 };
 
@@ -53,9 +56,76 @@ impl ProviderOutput {
             exclusive: false,
         }
     }
+
+    pub(super) fn exclusive(results: Vec<ResultItem>) -> Self {
+        Self {
+            results,
+            exclusive: true,
+        }
+    }
+
+    pub(super) fn exclusive_item(
+        provider_id: &'static str,
+        title: impl Into<String>,
+        score: i32,
+        actions: Vec<Action>,
+    ) -> Self {
+        Self::exclusive(vec![ResultItem {
+            provider_id,
+            title: title.into(),
+            score,
+            actions,
+        }])
+    }
 }
 
-pub(crate) trait Provider: Send + Sync {
+pub(super) fn split_first_term(input: &str) -> (&str, &str) {
+    let input = input.trim();
+    input
+        .split_once(char::is_whitespace)
+        .map_or((input, ""), |(head, tail)| (head, tail.trim()))
+}
+
+pub(super) fn strip_keyword_prefix<'a>(input: &'a str, prefixes: &[&str]) -> Option<&'a str> {
+    let (head, tail) = split_first_term(input);
+    prefixes
+        .iter()
+        .any(|prefix| head.eq_ignore_ascii_case(prefix))
+        .then_some(tail)
+}
+
+pub(super) fn strip_prefix_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    value
+        .get(..prefix.len())
+        .filter(|candidate| candidate.eq_ignore_ascii_case(prefix))
+        .map(|_| &value[prefix.len()..])
+}
+
+pub(super) fn truncate_chars(value: &str, limit: usize) -> String {
+    let mut chars = value.chars();
+    let mut output = chars.by_ref().take(limit).collect::<String>();
+    if chars.next().is_some() {
+        output.push('…');
+    }
+    output
+}
+
+pub(super) fn matches_all_terms(fields: &[&str], terms: &str) -> bool {
+    if terms.is_empty() {
+        return true;
+    }
+    let searchable = fields.join(" ").to_lowercase();
+    terms
+        .to_lowercase()
+        .split_whitespace()
+        .all(|term| searchable.contains(term))
+}
+
+pub(super) fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+pub(crate) trait Provider {
     fn id(&self) -> &'static str;
     fn query(&self, query: &Query, context: &ProviderContext<'_>) -> ProviderOutput;
 }

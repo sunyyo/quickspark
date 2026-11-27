@@ -17,7 +17,7 @@ use windows_sys::{
 
 use crate::{
     model::{Action, Query, ResultItem},
-    platform::windows::known_folder_path,
+    platform::windows::{known_folder_path, windows_program},
     search::{rank_entry, search_keys},
     storage::{load_allowed, load_blocked},
 };
@@ -78,7 +78,7 @@ impl ApplicationProvider {
             return Err(IndexError::NoReadableRoots);
         }
 
-        entries.sort_by_key(|entry| entry.name.to_lowercase());
+        entries.sort_by(|left, right| left.key.cmp(&right.key));
         // Windows commonly exposes the same shortcut through user/common Start Menu
         // and Desktop locations. For a launcher, identical display names are one app.
         entries.dedup_by(|left, right| left.key == right.key);
@@ -212,16 +212,9 @@ fn collect_dir(
                     && !is_blocked_tool(&name)
                     && !is_system_setting(&name)
                     && !is_noise_entry(&name, &path)
-                    && !is_user_blocked(&name, blocked)))
+                    && !matches_patterns(&name, blocked)))
         {
-            let (pinyin, initials) = search_keys(&name);
-            out.push(Entry {
-                key: name.to_lowercase(),
-                pinyin,
-                initials,
-                name,
-                target: EntryTarget::File(path),
-            });
+            out.push(Entry::new(name, EntryTarget::File(path)));
         }
     }
     true
@@ -230,7 +223,8 @@ fn collect_dir(
 fn collect_packaged_apps(out: &mut Vec<Entry>, blocked: &[String], allowed: &[String]) -> bool {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let script = r#"[Console]::OutputEncoding=[System.Text.Encoding]::UTF8; Get-StartApps | ForEach-Object { "$($_.Name)`t$($_.AppID)" }"#;
-    let Some(powershell) = system_program(r"System32\WindowsPowerShell\v1.0\powershell.exe") else {
+    let Some(powershell) = windows_program(r"System32\WindowsPowerShell\v1.0\powershell.exe")
+    else {
         return false;
     };
     let child = Command::new(powershell)
@@ -284,6 +278,19 @@ fn collect_packaged_apps(out: &mut Vec<Entry>, blocked: &[String], allowed: &[St
     true
 }
 
+impl Entry {
+    fn new(name: String, target: EntryTarget) -> Self {
+        let (pinyin, initials) = search_keys(&name);
+        Self {
+            key: name.to_lowercase(),
+            pinyin,
+            initials,
+            name,
+            target,
+        }
+    }
+}
+
 fn collect_packaged_entries(
     output: &str,
     out: &mut Vec<Entry>,
@@ -296,26 +303,12 @@ fn collect_packaged_entries(
             && (is_uninstaller(&name)
                 || is_blocked_tool(&name)
                 || is_system_setting(&name)
-                || is_user_blocked(&name, blocked))
+                || matches_patterns(&name, blocked))
         {
             continue;
         }
-        let (pinyin, initials) = search_keys(&name);
-        out.push(Entry {
-            key: name.to_lowercase(),
-            pinyin,
-            initials,
-            name,
-            target: EntryTarget::Packaged(app_id),
-        });
+        out.push(Entry::new(name, EntryTarget::Packaged(app_id)));
     }
-}
-
-fn system_program(relative: &str) -> Option<PathBuf> {
-    let root = PathBuf::from(env::var_os("SystemRoot")?);
-    root.is_absolute()
-        .then(|| root.join(relative))
-        .filter(|path| path.is_file())
 }
 
 pub(crate) fn parse_start_apps(output: &str) -> Vec<(String, String)> {
@@ -348,11 +341,7 @@ pub(crate) fn entry_score(
 
 pub(crate) fn is_uninstaller(name: &str) -> bool {
     let lower = name.to_lowercase();
-    lower.contains("卸载")
-        || lower.contains("移除")
-        || lower.contains("uninstall")
-        || lower.contains("uninst")
-        || lower.contains("unins")
+    lower.contains("卸载") || lower.contains("移除") || lower.contains("unins")
 }
 
 pub(crate) fn is_blocked_tool(name: &str) -> bool {
@@ -373,7 +362,6 @@ pub(crate) fn is_blocked_tool(name: &str) -> bool {
         "git gui",
         "github desktop",
         "visual studio",
-        "visual studio code",
         "android studio",
         "intellij idea",
         "pycharm",
@@ -394,8 +382,6 @@ pub(crate) fn is_blocked_tool(name: &str) -> bool {
         "ubuntu",
         "debian",
         "kali linux",
-        "developer command prompt",
-        "developer powershell",
     ];
     let exact = [
         "cmd", "cmd.exe", "git", "node", "npm", "yarn", "pnpm", "bun", "cargo", "rust", "rustc",
@@ -497,12 +483,7 @@ pub(crate) fn is_noise_entry(name: &str, path: &std::path::Path) -> bool {
         || name.ends_with(" manual")
 }
 
-pub(crate) fn is_user_blocked(name: &str, blocked: &[String]) -> bool {
-    let lower = name.to_lowercase();
-    blocked.iter().any(|pattern| lower.contains(pattern))
-}
-
-fn matches_patterns(name: &str, patterns: &[String]) -> bool {
+pub(crate) fn matches_patterns(name: &str, patterns: &[String]) -> bool {
     let lower = name.to_lowercase();
     patterns.iter().any(|pattern| lower.contains(pattern))
 }
@@ -513,7 +494,8 @@ mod tests {
 
     #[test]
     fn indexes_shortcuts_from_a_redirected_desktop_without_recursing_into_subfolders() {
-        let root = env::temp_dir().join(format!("quickspark-desktop-{}", std::process::id()));
+        let dir = crate::storage::TestTempDir::new("quickspark-desktop");
+        let root = dir.path();
         let desktop = root.join("移动的桌面");
         let nested = desktop.join("项目文件夹");
         fs::create_dir_all(&nested).unwrap();
@@ -534,7 +516,6 @@ mod tests {
         }
         assert_eq!(entries.len(), 1);
         assert!(matches!(&entries[0].target, EntryTarget::File(found) if found == &path));
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

@@ -1,4 +1,4 @@
-#![windows_subsystem = "windows"]
+#![cfg_attr(not(test), windows_subsystem = "windows")]
 #![deny(unsafe_op_in_unsafe_fn)]
 
 mod model;
@@ -26,13 +26,12 @@ use windows_sys::Win32::{
     Graphics::{
         Dwm::{DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute},
         Gdi::{
-            BeginPaint, CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, COLOR_WINDOW, CreateFontW,
-            CreatePen, CreateSolidBrush, DEFAULT_CHARSET, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX,
-            DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint, FF_DONTCARE,
+            BeginPaint, COLOR_WINDOW, CreatePen, CreateSolidBrush, DT_END_ELLIPSIS, DT_LEFT,
+            DT_NOPREFIX, DT_RIGHT, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawTextW, EndPaint,
             FW_NORMAL, FillRect, GetMonitorInfoW, GetStockObject, HBRUSH, HFONT, InvalidateRect,
             LineTo, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, MoveToEx, NULL_PEN,
-            OUT_DEFAULT_PRECIS, PAINTSTRUCT, PS_SOLID, RoundRect, SelectObject, SetBkColor,
-            SetBkMode, SetTextColor, TRANSPARENT, UpdateWindow,
+            PAINTSTRUCT, PS_SOLID, RoundRect, SelectObject, SetBkColor, SetBkMode, SetTextColor,
+            TRANSPARENT, UpdateWindow,
         },
     },
     System::{
@@ -61,9 +60,9 @@ use windows_sys::Win32::{
 use model::{Action, Query, ResultItem, SettingChange, SystemCommand, Usage};
 use platform::windows::{
     ApiKeyPromptResult, activate_window, append_ai_answer, append_ai_reasoning, cancel_ai_answer,
-    close_ai_answer, copy_text, fail_ai_answer, finish_ai_answer, prompt_ai_api_key,
-    prompt_tavily_api_key, shell_execute, show_ai_answer, show_ai_stream, theme, update_ai_status,
-    wide, windows_program,
+    close_ai_answer, copy_text, copy_wide, create_ui_font, fail_ai_answer, finish_ai_answer,
+    prompt_ai_api_key, prompt_tavily_api_key, scale_dpi as px, shell_execute, show_ai_answer,
+    show_ai_stream, theme, update_ai_status, wide, windows_program,
 };
 use providers::{
     AiEvent, AiService, ApplicationProvider, CalculatorProvider, CommandProvider,
@@ -72,8 +71,9 @@ use providers::{
 };
 use providers::{DriveProvider, UrlProvider};
 use storage::{
-    HotkeyChoice, Settings, load_light_theme, load_pinned, load_settings, load_usage,
-    migrate_legacy_data, save_pinned, save_settings, save_theme, save_usage, set_autostart,
+    HotkeyChoice, Settings, ensure_commands_file_if_target, load_light_theme, load_pinned,
+    load_settings, load_usage, migrate_legacy_data, save_pinned, save_settings, save_theme,
+    save_usage, set_autostart,
 };
 
 const HOTKEY_ID: i32 = 1;
@@ -133,10 +133,6 @@ fn now_seconds() -> u64 {
         .as_secs()
 }
 
-fn px(value: i32, dpi: u32) -> i32 {
-    value * dpi as i32 / 96
-}
-
 type AppCell = RefCell<App>;
 
 fn try_with_state<T, R>(state: &RefCell<T>, access: impl FnOnce(&T) -> R) -> Option<R> {
@@ -161,10 +157,6 @@ unsafe fn with_app<R>(hwnd: HWND, access: impl FnOnce(&App) -> R) -> Option<R> {
 unsafe fn with_app_mut<R>(hwnd: HWND, access: impl FnOnce(&mut App) -> R) -> Option<R> {
     let pointer = unsafe { app_cell(hwnd) }?;
     try_with_state_mut(unsafe { pointer.as_ref() }, access)
-}
-
-unsafe fn has_app(hwnd: HWND) -> bool {
-    unsafe { app_cell(hwnd).is_some() }
 }
 
 unsafe fn query(edit: HWND) -> String {
@@ -199,7 +191,7 @@ unsafe fn refresh_results(hwnd: HWND, previous: Option<usize>) {
     };
     let input = unsafe { query(edit) };
     let query = Query::new(&input);
-    let Some((list, titles, selected)) = (unsafe {
+    let Some((list, count, selected)) = (unsafe {
         with_app_mut(hwnd, |state| {
             let context = ProviderContext {
                 usage: &state.usage,
@@ -222,23 +214,18 @@ unsafe fn refresh_results(hwnd: HWND, previous: Option<usize>) {
                 })
                 .unwrap_or(0);
             state.results = results;
-            let titles = state
-                .results
-                .iter()
-                .map(|result| result.title.clone())
-                .collect::<Vec<_>>();
-            (state.list, titles, selected)
+            (state.list, state.results.len(), selected)
         })
     }) else {
         return;
     };
 
+    const EMPTY_ITEM: [u16; 1] = [0];
     unsafe { SendMessageW(list, LB_RESETCONTENT, 0, 0) };
-    for title in &titles {
-        let label = wide(title);
-        unsafe { SendMessageW(list, LB_ADDSTRING, 0, label.as_ptr() as LPARAM) };
+    for _ in 0..count {
+        unsafe { SendMessageW(list, LB_ADDSTRING, 0, EMPTY_ITEM.as_ptr() as LPARAM) };
     }
-    if !titles.is_empty() {
+    if count > 0 {
         unsafe { SendMessageW(list, LB_SETCURSEL, selected, 0) };
     }
 }
@@ -264,24 +251,6 @@ unsafe fn launch_result(hwnd: HWND, position: usize) {
     if let Some(action) = action {
         unsafe { execute_action(hwnd, action) };
     }
-}
-
-unsafe fn launch_result_action(hwnd: HWND, position: usize, action_position: usize) {
-    let action = unsafe {
-        with_app(hwnd, |state| {
-            state
-                .results
-                .get(position)
-                .and_then(|result| result.actions.get(action_position))
-                .cloned()
-        })
-    }
-    .flatten();
-    let Some(action) = action else {
-        return;
-    };
-
-    unsafe { execute_action(hwnd, action) };
 }
 
 unsafe fn execute_action(hwnd: HWND, action: Action) {
@@ -317,7 +286,7 @@ unsafe fn execute_action(hwnd: HWND, action: Action) {
                 .then(|| format!("\"shell:AppsFolder\\{app_id}\""))
                 .zip(windows_program("explorer.exe"))
                 .is_some_and(|(parameters, explorer)| unsafe {
-                    shell_execute(hwnd, "open", &explorer, Some(&parameters))
+                    shell_execute(hwnd, "open", &explorer.to_string_lossy(), Some(&parameters))
                 });
             if !launched {
                 unsafe { show_action_error(hwnd, "无法启动该系统应用。") };
@@ -337,7 +306,7 @@ unsafe fn execute_action(hwnd: HWND, action: Action) {
         Action::OpenContainingFolder { path } => {
             let parameters = format!("/select,\"{}\"", path.to_string_lossy());
             let opened = windows_program("explorer.exe").is_some_and(|explorer| unsafe {
-                shell_execute(hwnd, "open", &explorer, Some(&parameters))
+                shell_execute(hwnd, "open", &explorer.to_string_lossy(), Some(&parameters))
             });
             if !opened {
                 unsafe { show_action_error(hwnd, "无法打开程序所在位置。") };
@@ -345,6 +314,7 @@ unsafe fn execute_action(hwnd: HWND, action: Action) {
             opened
         }
         Action::OpenPath { path } => {
+            ensure_commands_file_if_target(&path);
             let target = path.to_string_lossy();
             let opened = unsafe { shell_execute(hwnd, "open", &target, None) };
             if !opened {
@@ -484,53 +454,27 @@ unsafe fn execute_action(hwnd: HWND, action: Action) {
             return;
         }
         Action::ConfigureAiKey => {
-            let _modal = unsafe { begin_modal(hwnd) };
-            match prompt_ai_api_key(hwnd, &storage::load_ai_config().api_url) {
-                Ok(ApiKeyPromptResult::Saved) => unsafe {
-                    MessageBoxW(
-                        hwnd,
-                        wide("API Key 已安全保存到 Windows 凭据管理器。").as_ptr(),
-                        wide("QuickSpark AI").as_ptr(),
-                        MB_OK | MB_ICONINFORMATION,
-                    );
-                },
-                Ok(ApiKeyPromptResult::Cleared) => unsafe {
-                    MessageBoxW(
-                        hwnd,
-                        wide("已清除保存的 AI API Key。").as_ptr(),
-                        wide("QuickSpark AI").as_ptr(),
-                        MB_OK | MB_ICONINFORMATION,
-                    );
-                },
-                Ok(ApiKeyPromptResult::Cancelled) => {}
-                Err(error) => unsafe { show_action_error(hwnd, &error) },
-            }
-            unsafe { refresh(hwnd) };
+            unsafe {
+                handle_api_key_prompt(
+                    hwnd,
+                    prompt_ai_api_key(hwnd, &storage::load_ai_config().api_url),
+                    "QuickSpark AI",
+                    "API Key 已安全保存到 Windows 凭据管理器。",
+                    "已清除保存的 AI API Key。",
+                )
+            };
             return;
         }
         Action::ConfigureTavilyKey => {
-            let _modal = unsafe { begin_modal(hwnd) };
-            match prompt_tavily_api_key(hwnd) {
-                Ok(ApiKeyPromptResult::Saved) => unsafe {
-                    MessageBoxW(
-                        hwnd,
-                        wide("Tavily API Key 已安全保存到 Windows 凭据管理器。").as_ptr(),
-                        wide("QuickSpark Tavily").as_ptr(),
-                        MB_OK | MB_ICONINFORMATION,
-                    );
-                },
-                Ok(ApiKeyPromptResult::Cleared) => unsafe {
-                    MessageBoxW(
-                        hwnd,
-                        wide("已清除保存的 Tavily API Key。").as_ptr(),
-                        wide("QuickSpark Tavily").as_ptr(),
-                        MB_OK | MB_ICONINFORMATION,
-                    );
-                },
-                Ok(ApiKeyPromptResult::Cancelled) => {}
-                Err(error) => unsafe { show_action_error(hwnd, &error) },
-            }
-            unsafe { refresh(hwnd) };
+            unsafe {
+                handle_api_key_prompt(
+                    hwnd,
+                    prompt_tavily_api_key(hwnd),
+                    "QuickSpark Tavily",
+                    "Tavily API Key 已安全保存到 Windows 凭据管理器。",
+                    "已清除保存的 Tavily API Key。",
+                )
+            };
             return;
         }
     };
@@ -577,6 +521,37 @@ unsafe fn begin_modal(hwnd: HWND) -> ModalGuard {
     ModalGuard { hwnd }
 }
 
+unsafe fn handle_api_key_prompt(
+    hwnd: HWND,
+    result: Result<ApiKeyPromptResult, String>,
+    title: &str,
+    saved_message: &str,
+    cleared_message: &str,
+) {
+    let _modal = unsafe { begin_modal(hwnd) };
+    match result {
+        Ok(ApiKeyPromptResult::Saved) => unsafe {
+            MessageBoxW(
+                hwnd,
+                wide(saved_message).as_ptr(),
+                wide(title).as_ptr(),
+                MB_OK | MB_ICONINFORMATION,
+            );
+        },
+        Ok(ApiKeyPromptResult::Cleared) => unsafe {
+            MessageBoxW(
+                hwnd,
+                wide(cleared_message).as_ptr(),
+                wide(title).as_ptr(),
+                MB_OK | MB_ICONINFORMATION,
+            );
+        },
+        Ok(ApiKeyPromptResult::Cancelled) => {}
+        Err(error) => unsafe { show_action_error(hwnd, &error) },
+    }
+    unsafe { refresh(hwnd) };
+}
+
 unsafe fn show_action_error(hwnd: HWND, message: &str) {
     let _modal = unsafe { begin_modal(hwnd) };
     unsafe {
@@ -599,19 +574,20 @@ unsafe fn launch_selected_matching(hwnd: HWND, matches: fn(&Action) -> bool) -> 
     let Some(position) = (unsafe { selected_result_position(hwnd) }) else {
         return false;
     };
-    let action_position = unsafe {
+    let action = unsafe {
         with_app(hwnd, |state| {
             state
                 .results
                 .get(position)
-                .and_then(|result| result.actions.iter().position(matches))
+                .and_then(|result| result.actions.iter().find(|action| matches(action)))
+                .cloned()
         })
     }
     .flatten();
-    let Some(action_position) = action_position else {
+    let Some(action) = action else {
         return false;
     };
-    unsafe { launch_result_action(hwnd, position, action_position) };
+    unsafe { execute_action(hwnd, action) };
     true
 }
 
@@ -788,23 +764,17 @@ unsafe fn tray_data(hwnd: HWND) -> NOTIFYICONDATAW {
     data.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
     data.uCallbackMessage = TRAY_MESSAGE;
     data.hIcon = unsafe { application_icon() };
-    let hotkey = if unsafe { has_app(hwnd) } {
-        unsafe {
-            with_app(hwnd, |state| {
-                if state.hotkey_registered {
-                    state.settings.hotkey.label()
-                } else {
-                    "快捷键不可用"
-                }
-            })
-        }
-        .unwrap_or("快捷键不可用")
-    } else {
-        HotkeyChoice::AltSpace.label()
-    };
-    let tip = wide(&format!("QuickSpark · {hotkey}"));
-    let count = tip.len().min(data.szTip.len());
-    data.szTip[..count].copy_from_slice(&tip[..count]);
+    let hotkey = unsafe {
+        with_app(hwnd, |state| {
+            if state.hotkey_registered {
+                state.settings.hotkey.label()
+            } else {
+                "快捷键不可用"
+            }
+        })
+    }
+    .unwrap_or("快捷键不可用");
+    copy_wide(&format!("QuickSpark · {hotkey}"), &mut data.szTip);
     data
 }
 
@@ -819,56 +789,63 @@ unsafe fn application_icon() -> HICON {
     }
 }
 
+fn create_launcher_fonts(dpi: u32) -> Option<(HFONT, HFONT)> {
+    let font = create_ui_font(dpi, 19, FW_NORMAL);
+    let shortcut_font = create_ui_font(dpi, 18, FW_NORMAL);
+    if font.is_null() || shortcut_font.is_null() {
+        unsafe {
+            if !font.is_null() {
+                DeleteObject(font as _);
+            }
+            if !shortcut_font.is_null() {
+                DeleteObject(shortcut_font as _);
+            }
+        }
+        return None;
+    }
+    Some((font, shortcut_font))
+}
+
+unsafe fn apply_launcher_metrics(edit: HWND, list: HWND, font: HFONT, dpi: u32) {
+    unsafe {
+        SendMessageW(edit, WM_SETFONT, font as WPARAM, 1);
+        SendMessageW(list, WM_SETFONT, font as WPARAM, 1);
+        // Tight pure-text layout: 8px origin + 8px margin = 16px.
+        let margin = px(8, dpi) as u32;
+        SendMessageW(
+            edit,
+            EM_SETMARGINS,
+            (EC_LEFTMARGIN | EC_RIGHTMARGIN) as WPARAM,
+            (margin | (margin << 16)) as LPARAM,
+        );
+        let item_height = px(32, dpi);
+        SendMessageW(list, LB_SETITEMHEIGHT, 0, item_height as LPARAM);
+        MoveWindow(
+            edit,
+            px(8, dpi),
+            px(8, dpi),
+            px(WIDTH - 16, dpi),
+            px(30, dpi),
+            1,
+        );
+        MoveWindow(
+            list,
+            px(8, dpi),
+            px(40, dpi),
+            px(WIDTH - 16, dpi),
+            item_height * VISIBLE_RESULT_COUNT as i32,
+            1,
+        );
+    }
+}
+
 unsafe fn apply_dpi(hwnd: HWND, dpi: u32) {
     if unsafe { with_app(hwnd, |state| state.dpi == dpi) }.unwrap_or(true) {
         return;
     }
-    let face = wide("Microsoft YaHei UI");
-    let font = unsafe {
-        CreateFontW(
-            px(-19, dpi),
-            0,
-            0,
-            0,
-            FW_NORMAL as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET as u32,
-            OUT_DEFAULT_PRECIS as u32,
-            CLIP_DEFAULT_PRECIS as u32,
-            CLEARTYPE_QUALITY as u32,
-            FF_DONTCARE as u32,
-            face.as_ptr(),
-        )
-    };
-    let shortcut_font = unsafe {
-        CreateFontW(
-            px(-18, dpi),
-            0,
-            0,
-            0,
-            FW_NORMAL as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET as u32,
-            OUT_DEFAULT_PRECIS as u32,
-            CLIP_DEFAULT_PRECIS as u32,
-            CLEARTYPE_QUALITY as u32,
-            FF_DONTCARE as u32,
-            face.as_ptr(),
-        )
-    };
-    if font.is_null() || shortcut_font.is_null() {
-        if !font.is_null() {
-            unsafe { DeleteObject(font as _) };
-        }
-        if !shortcut_font.is_null() {
-            unsafe { DeleteObject(shortcut_font as _) };
-        }
+    let Some((font, shortcut_font)) = create_launcher_fonts(dpi) else {
         return;
-    }
+    };
     let swapped = unsafe {
         with_app_mut(hwnd, |state| {
             let old = (state.edit, state.list, state.font, state.shortcut_font);
@@ -886,38 +863,11 @@ unsafe fn apply_dpi(hwnd: HWND, dpi: u32) {
         return;
     };
     unsafe {
-        SendMessageW(edit, WM_SETFONT, font as WPARAM, 1);
-        SendMessageW(list, WM_SETFONT, font as WPARAM, 1);
-        let left = px(8, dpi) as u32;
-        let right = px(8, dpi) as u32;
-        SendMessageW(
-            edit,
-            EM_SETMARGINS,
-            (EC_LEFTMARGIN | EC_RIGHTMARGIN) as WPARAM,
-            (left | (right << 16)) as LPARAM,
-        );
-        let item_height = px(32, dpi);
-        SendMessageW(list, LB_SETITEMHEIGHT, 0, item_height as LPARAM);
-        MoveWindow(
-            edit,
-            px(8, dpi),
-            px(8, dpi),
-            px(WIDTH - 16, dpi),
-            px(30, dpi),
-            1,
-        );
-        MoveWindow(
-            list,
-            px(8, dpi),
-            px(40, dpi),
-            px(WIDTH - 16, dpi),
-            item_height * 8,
-            1,
-        );
+        apply_launcher_metrics(edit, list, font, dpi);
         DeleteObject(old_font as _);
         DeleteObject(old_shortcut_font as _);
+        InvalidateRect(hwnd, null(), 1);
     }
-    unsafe { InvalidateRect(hwnd, null(), 1) };
 }
 
 unsafe fn show_launcher(hwnd: HWND) {
@@ -957,18 +907,11 @@ unsafe fn show_launcher(hwnd: HWND) {
     unsafe { refresh_results(hwnd, None) };
 }
 
-unsafe fn show_manual(hwnd: HWND) {
+unsafe fn show_launcher_query(hwnd: HWND, value: &str) {
     if unsafe { IsWindowVisible(hwnd) } == 0 {
         unsafe { show_launcher(hwnd) };
     }
-    unsafe { set_launcher_query(hwnd, "?") };
-}
-
-unsafe fn show_settings(hwnd: HWND) {
-    if unsafe { IsWindowVisible(hwnd) } == 0 {
-        unsafe { show_launcher(hwnd) };
-    }
-    unsafe { set_launcher_query(hwnd, "settings") };
+    unsafe { set_launcher_query(hwnd, value) };
 }
 
 unsafe fn show_tray_menu(hwnd: HWND) {
@@ -1068,6 +1011,7 @@ unsafe fn register_available_hotkey(hwnd: HWND, start: HotkeyChoice) -> Option<H
 }
 
 unsafe fn apply_setting_change(hwnd: HWND, change: SettingChange) {
+    let mut save_needed = false;
     match change {
         SettingChange::CycleHotkey => {
             let Some((current, was_registered)) = (unsafe {
@@ -1092,7 +1036,9 @@ unsafe fn apply_setting_change(hwnd: HWND, change: SettingChange) {
                     }
                     let tray = unsafe { tray_data(hwnd) };
                     unsafe { Shell_NotifyIconW(NIM_MODIFY, &tray) };
-                    if next == current && was_registered {
+                    if next != current {
+                        save_needed = true;
+                    } else if was_registered {
                         unsafe {
                             show_action_error(
                                 hwnd,
@@ -1149,6 +1095,7 @@ unsafe fn apply_setting_change(hwnd: HWND, change: SettingChange) {
             {
                 return;
             }
+            save_needed = true;
         }
         SettingChange::CycleWebEngine => {
             if unsafe {
@@ -1160,13 +1107,16 @@ unsafe fn apply_setting_change(hwnd: HWND, change: SettingChange) {
             {
                 return;
             }
+            save_needed = true;
         }
     }
-    let Some(settings) = (unsafe { with_app(hwnd, |state| state.settings.clone()) }) else {
-        return;
-    };
-    if !save_settings(&settings) {
-        unsafe { show_action_error(hwnd, "设置已应用，但无法保存到磁盘。") };
+    if save_needed {
+        let Some(settings) = (unsafe { with_app(hwnd, |state| state.settings.clone()) }) else {
+            return;
+        };
+        if !save_settings(&settings) {
+            unsafe { show_action_error(hwnd, "设置已应用，但无法保存到磁盘。") };
+        }
     }
     unsafe { refresh(hwnd) };
     // The label may change after applying a setting, so restore by action rather
@@ -1214,12 +1164,21 @@ unsafe fn execute_system_command(hwnd: HWND, command: SystemCommand) -> bool {
     let succeeded = match command {
         SystemCommand::Lock => unsafe { LockWorkStation() != 0 },
         SystemCommand::Sleep => unsafe { SetSuspendState(false, false, false) },
-        SystemCommand::SignOut => windows_program(r"System32\shutdown.exe")
-            .is_some_and(|target| unsafe { shell_execute(hwnd, "open", &target, Some("/l")) }),
-        SystemCommand::Shutdown => windows_program(r"System32\shutdown.exe")
-            .is_some_and(|target| unsafe { shell_execute(hwnd, "open", &target, Some("/s /t 0")) }),
-        SystemCommand::Restart => windows_program(r"System32\shutdown.exe")
-            .is_some_and(|target| unsafe { shell_execute(hwnd, "open", &target, Some("/r /t 0")) }),
+        SystemCommand::SignOut => {
+            windows_program(r"System32\shutdown.exe").is_some_and(|target| unsafe {
+                shell_execute(hwnd, "open", &target.to_string_lossy(), Some("/l"))
+            })
+        }
+        SystemCommand::Shutdown => {
+            windows_program(r"System32\shutdown.exe").is_some_and(|target| unsafe {
+                shell_execute(hwnd, "open", &target.to_string_lossy(), Some("/s /t 0"))
+            })
+        }
+        SystemCommand::Restart => {
+            windows_program(r"System32\shutdown.exe").is_some_and(|target| unsafe {
+                shell_execute(hwnd, "open", &target.to_string_lossy(), Some("/r /t 0"))
+            })
+        }
     };
     if !succeeded {
         unsafe { show_action_error(hwnd, "系统命令执行失败。") };
@@ -1231,7 +1190,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
     if TASKBAR_CREATED
         .get()
         .is_some_and(|taskbar_created| *taskbar_created == msg)
-        && unsafe { has_app(hwnd) }
+        && unsafe { app_cell(hwnd).is_some() }
     {
         let tray = unsafe { tray_data(hwnd) };
         unsafe { Shell_NotifyIconW(NIM_ADD, &tray) };
@@ -1243,55 +1202,18 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             let light_theme = load_light_theme();
             let mut settings = load_settings();
             let colors = theme(light_theme);
-            let face = wide("Microsoft YaHei UI");
-            let font = unsafe {
-                CreateFontW(
-                    px(-19, dpi),
-                    0,
-                    0,
-                    0,
-                    FW_NORMAL as i32,
-                    0,
-                    0,
-                    0,
-                    DEFAULT_CHARSET as u32,
-                    OUT_DEFAULT_PRECIS as u32,
-                    CLIP_DEFAULT_PRECIS as u32,
-                    CLEARTYPE_QUALITY as u32,
-                    FF_DONTCARE as u32,
-                    face.as_ptr(),
-                )
-            };
-            let shortcut_font = unsafe {
-                CreateFontW(
-                    px(-18, dpi),
-                    0,
-                    0,
-                    0,
-                    FW_NORMAL as i32,
-                    0,
-                    0,
-                    0,
-                    DEFAULT_CHARSET as u32,
-                    OUT_DEFAULT_PRECIS as u32,
-                    CLIP_DEFAULT_PRECIS as u32,
-                    CLEARTYPE_QUALITY as u32,
-                    FF_DONTCARE as u32,
-                    face.as_ptr(),
-                )
-            };
+            let fonts = create_launcher_fonts(dpi);
             let background = unsafe { CreateSolidBrush(colors.bg) };
-            let item_height = px(32, dpi);
             let edit = unsafe {
                 CreateWindowExW(
                     0,
                     wide("EDIT").as_ptr(),
                     null(),
                     WS_CHILD | WS_VISIBLE | WS_TABSTOP | ES_AUTOHSCROLL as u32,
-                    px(8, dpi),
-                    px(8, dpi),
-                    px(WIDTH - 16, dpi),
-                    px(30, dpi),
+                    0,
+                    0,
+                    0,
+                    0,
                     hwnd,
                     EDIT_ID as _,
                     null_mut(),
@@ -1308,27 +1230,22 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                         | LBS_NOTIFY as u32
                         | LBS_NOINTEGRALHEIGHT as u32
                         | LBS_OWNERDRAWFIXED as u32,
-                    px(8, dpi),
-                    px(40, dpi),
-                    px(WIDTH - 16, dpi),
-                    item_height * VISIBLE_RESULT_COUNT as i32,
+                    0,
+                    0,
+                    0,
+                    0,
                     hwnd,
                     LIST_ID as _,
                     null_mut(),
                     null(),
                 )
             };
-            if font.is_null()
-                || shortcut_font.is_null()
-                || background.is_null()
-                || edit.is_null()
-                || list.is_null()
-            {
+            let Some((font, shortcut_font)) =
+                fonts.filter(|_| !background.is_null() && !edit.is_null() && !list.is_null())
+            else {
                 unsafe {
-                    if !font.is_null() {
+                    if let Some((font, shortcut_font)) = fonts {
                         DeleteObject(font as _);
-                    }
-                    if !shortcut_font.is_null() {
                         DeleteObject(shortcut_font as _);
                     }
                     if !background.is_null() {
@@ -1344,26 +1261,15 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
                 // Returning -1 aborts parent creation; Windows destroys any child
                 // controls that were successfully created before the failure.
                 return -1;
-            }
+            };
             unsafe {
-                SendMessageW(edit, WM_SETFONT, font as WPARAM, 1);
-                SendMessageW(list, WM_SETFONT, font as WPARAM, 1);
-                // Tight pure-text layout: 8px origin + 8px margin = 16px.
-                let left_margin = px(8, dpi) as u32;
-                let right_margin = px(8, dpi) as u32;
-                SendMessageW(
-                    edit,
-                    EM_SETMARGINS,
-                    (EC_LEFTMARGIN | EC_RIGHTMARGIN) as WPARAM,
-                    (left_margin | (right_margin << 16)) as LPARAM,
-                );
+                apply_launcher_metrics(edit, list, font, dpi);
                 SendMessageW(
                     edit,
                     EM_SETCUEBANNER,
                     1,
                     wide("搜索应用，输入 ? 查看说明").as_ptr() as LPARAM,
                 );
-                SendMessageW(list, LB_SETITEMHEIGHT, 0, item_height as LPARAM);
             };
             let preferred_hotkey = settings.hotkey;
             let registered_hotkey = unsafe { register_available_hotkey(hwnd, preferred_hotkey) };
@@ -1404,7 +1310,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             providers.register(ConverterProvider);
             providers.register(WindowSwitcherProvider);
             providers.register(FileSearchProvider::new(hwnd as usize, FILE_SEARCH_READY));
-            providers.register(ai_service.provider());
+            providers.register(ai_service.clone());
             providers.register(ApplicationProvider::empty());
             let state = Box::new(RefCell::new(App {
                 edit,
@@ -1764,11 +1670,11 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             0
         }
         WM_COMMAND if w == MENU_HELP => {
-            unsafe { show_manual(hwnd) };
+            unsafe { show_launcher_query(hwnd, "?") };
             0
         }
         WM_COMMAND if w == MENU_SETTINGS => {
-            unsafe { show_settings(hwnd) };
+            unsafe { show_launcher_query(hwnd, "settings") };
             0
         }
         WM_COMMAND if w == MENU_REFRESH => {
@@ -1795,18 +1701,6 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, w: WPARAM, l: LPARAM) -
             }
             if id == LIST_ID && code == LBN_DBLCLK as u16 {
                 unsafe { launch_selected(hwnd) };
-            }
-            0
-        }
-        WM_KEYDOWN => {
-            match w as u16 {
-                VK_ESCAPE => unsafe {
-                    ShowWindow(hwnd, SW_HIDE);
-                },
-                VK_RETURN => unsafe { launch_selected(hwnd) },
-                VK_UP => unsafe { move_selection(hwnd, -1) },
-                VK_DOWN => unsafe { move_selection(hwnd, 1) },
-                _ => return unsafe { DefWindowProcW(hwnd, msg, w, l) },
             }
             0
         }
@@ -1926,10 +1820,6 @@ fn main() {
                 launch_result(hwnd, position);
                 continue;
             }
-            if msg.message == WM_KEYDOWN && msg.wParam as u16 == VK_F1 && launcher_target {
-                show_manual(hwnd);
-                continue;
-            }
             if msg.message == WM_MOUSEWHEEL && launcher_target {
                 let delta = wheel_selection_delta(msg.wParam);
                 if delta != 0 {
@@ -1938,6 +1828,10 @@ fn main() {
                 continue;
             }
             if msg.message == WM_KEYDOWN && launcher_target {
+                if msg.wParam as u16 == VK_F1 {
+                    show_launcher_query(hwnd, "?");
+                    continue;
+                }
                 if handle_action_shortcut(
                     hwnd,
                     msg.wParam as u16,

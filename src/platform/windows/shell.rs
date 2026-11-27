@@ -52,8 +52,8 @@ pub(crate) fn known_folder_path(id: &windows_sys::core::GUID) -> Option<PathBuf>
     result
 }
 
-pub(crate) fn windows_program(relative: &str) -> Option<String> {
+pub(crate) fn windows_program(relative: &str) -> Option<PathBuf> {
     let root = PathBuf::from(env::var_os("SystemRoot")?);
     let path = root.is_absolute().then(|| root.join(relative))?;
-    path.is_file().then(|| path.to_string_lossy().into_owned())
+    path.is_file().then_some(path)
 }

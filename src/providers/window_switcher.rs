@@ -12,7 +12,7 @@ use crate::{
     search::fuzzy_score,
 };
 
-use super::{Provider, ProviderContext, ProviderOutput};
+use super::{Provider, ProviderContext, ProviderOutput, strip_keyword_prefix};
 
 const PROVIDER_ID: &str = "window-switcher";
 
@@ -49,21 +49,12 @@ impl Provider for WindowSwitcherProvider {
                 })
             })
             .collect();
-        ProviderOutput {
-            results,
-            exclusive: true,
-        }
+        ProviderOutput::exclusive(results)
     }
 }
 
 fn window_query(input: &str) -> Option<&str> {
-    if input == "win" || input == "window" {
-        return Some("");
-    }
-    input
-        .strip_prefix("win ")
-        .or_else(|| input.strip_prefix("window "))
-        .map(str::trim)
+    strip_keyword_prefix(input, &["win", "window"])
 }
 
 struct WindowEntry {
@@ -140,6 +131,8 @@ mod tests {
 
     #[test]
     fn desktop_window_enumeration_is_safe_when_no_matches_exist() {
-        let _ = enumerate_windows();
+        crate::platform::windows::run_on_ui_thread(|| {
+            let _ = enumerate_windows();
+        });
     }
 }

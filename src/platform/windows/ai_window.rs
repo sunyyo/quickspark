@@ -12,12 +12,12 @@ use windows_sys::Win32::{
     Foundation::{HINSTANCE, HWND, LPARAM, LRESULT, RECT, WPARAM},
     Graphics::Dwm::{DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute},
     Graphics::Gdi::{
-        CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, CreatePen, CreateSolidBrush,
-        DEFAULT_CHARSET, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT, DT_NOPREFIX, DT_SINGLELINE,
-        DT_VCENTER, DeleteObject, DrawFocusRect, DrawTextW, FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD,
-        FillRect, GetMonitorInfoW, HBRUSH, HDC, HFONT, InvalidateRect, MONITOR_DEFAULTTONEAREST,
-        MONITORINFO, MonitorFromPoint, MonitorFromWindow, OUT_DEFAULT_PRECIS, PS_SOLID, RoundRect,
-        SelectObject, SetBkColor, SetBkMode, SetTextColor, TRANSPARENT, UpdateWindow,
+        CreatePen, CreateSolidBrush, DEFAULT_CHARSET, DT_CENTER, DT_END_ELLIPSIS, DT_LEFT,
+        DT_NOPREFIX, DT_SINGLELINE, DT_VCENTER, DeleteObject, DrawFocusRect, DrawTextW,
+        FF_DONTCARE, FW_NORMAL, FW_SEMIBOLD, FillRect, GetMonitorInfoW, HBRUSH, HDC, HFONT,
+        InvalidateRect, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromPoint, MonitorFromWindow,
+        PS_SOLID, RoundRect, SelectObject, SetBkColor, SetBkMode, SetTextColor, TRANSPARENT,
+        UpdateWindow,
     },
     System::LibraryLoader::{GetModuleHandleW, LoadLibraryW},
     UI::{
@@ -30,16 +30,16 @@ use windows_sys::Win32::{
         Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass},
         WindowsAndMessaging::{
             BM_CLICK, BS_OWNERDRAW, CREATESTRUCTW, CS_HREDRAW, CS_VREDRAW, CreateWindowExW,
-            DefWindowProcW, DestroyWindow, ES_AUTOVSCROLL, ES_MULTILINE, ES_READONLY,
-            GetClientRect, GetCursorPos, GetNextDlgTabItem, GetWindowRect, GetWindowTextLengthW,
-            GetWindowTextW, IDC_ARROW, IsWindow, KillTimer, LoadCursorW, MB_ICONERROR, MB_OK,
-            MINMAXINFO, MessageBoxW, MoveWindow, PostMessageW, RegisterClassW, SW_HIDE, SW_SHOW,
-            SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetTimer,
-            SetWindowPos, SetWindowTextW, ShowWindow, WM_CLOSE, WM_COMMAND, WM_COPY, WM_CREATE,
-            WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED,
-            WM_DRAWITEM, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_NCDESTROY, WM_SETFOCUS,
-            WM_SETFONT, WM_SETREDRAW, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CHILD, WS_EX_TOOLWINDOW,
-            WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+            DefWindowProcW, DestroyWindow, EC_LEFTMARGIN, EC_RIGHTMARGIN, ES_AUTOVSCROLL,
+            ES_MULTILINE, ES_READONLY, GetClientRect, GetCursorPos, GetNextDlgTabItem,
+            GetWindowRect, GetWindowTextLengthW, GetWindowTextW, IDC_ARROW, KillTimer, LoadCursorW,
+            MB_ICONERROR, MB_OK, MINMAXINFO, MessageBoxW, MoveWindow, PostMessageW, RegisterClassW,
+            SW_HIDE, SW_SHOW, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW, SetForegroundWindow,
+            SetTimer, SetWindowPos, SetWindowTextW, ShowWindow, WM_CLOSE, WM_COMMAND, WM_COPY,
+            WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLOREDIT, WM_CTLCOLORSTATIC, WM_DESTROY,
+            WM_DPICHANGED, WM_DRAWITEM, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_KEYDOWN, WM_NCDESTROY,
+            WM_SETFOCUS, WM_SETFONT, WM_SETREDRAW, WM_SIZE, WM_TIMER, WNDCLASSW, WS_CHILD,
+            WS_EX_TOOLWINDOW, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
         },
     },
 };
@@ -47,7 +47,7 @@ use windows_sys::Win32::{
 use super::clipboard::copy_text;
 use super::markdown::{MarkdownSpan, MarkdownStyle, render_markdown};
 use super::theme::{Theme as AnswerColors, theme as answer_colors};
-use super::wide;
+use super::{copy_wide, create_ui_font, scale_dpi as scale, wide};
 use crate::model::AiCompletion;
 
 mod rendering;
@@ -65,8 +65,7 @@ const CLOSE_BUTTON_ID: usize = 4103;
 const THINK_TOGGLE_ID: usize = 4104;
 const COPY_THINKING_ID: usize = 4105;
 const EDIT_SUBCLASS_ID: usize = 1;
-const THINK_EDIT_SUBCLASS_ID: usize = 2;
-const BUTTON_SUBCLASS_ID: usize = 3;
+const BUTTON_SUBCLASS_ID: usize = 2;
 const RENDER_TIMER_ID: usize = 1;
 const RENDER_INTERVAL_MS: u32 = 40;
 const ANSWER_DISPLAY_CHARS: usize = 200_000;
@@ -80,8 +79,6 @@ const EM_SCROLLCARET: u32 = 0x00B7;
 const EM_SETBKGNDCOLOR: u32 = 0x0443;
 const EM_SETCHARFORMAT: u32 = 0x0444;
 const SS_NOPREFIX: u32 = 0x0080;
-const EC_LEFTMARGIN: usize = 0x0001;
-const EC_RIGHTMARGIN: usize = 0x0002;
 const SCF_SELECTION: usize = 0x0001;
 const CFM_BOLD: u32 = 0x0000_0001;
 const CFM_ITALIC: u32 = 0x0000_0002;
@@ -107,11 +104,11 @@ struct CharFormatW {
     face_name: [u16; 32],
 }
 
-struct AnswerInit {
+struct AnswerInit<'a> {
     initial_status: &'static str,
-    prompt: String,
-    answer: String,
-    reasoning: String,
+    prompt: &'a str,
+    answer: &'a str,
+    reasoning: &'a str,
     owner: HWND,
     cancel_message: u32,
     closed_message: u32,
@@ -134,7 +131,6 @@ struct AnswerWindow {
     close_button: HWND,
     heading_font: HFONT,
     body_font: HFONT,
-    answer_font: HFONT,
     hint_font: HFONT,
     window_brush: HBRUSH,
     answer_brush: HBRUSH,
@@ -146,7 +142,6 @@ struct AnswerWindow {
     thinking_rich_edit: bool,
     render_dirty: bool,
     thinking_dirty: bool,
-    thinking_visible: bool,
     thinking_expanded: bool,
     thinking_complete: bool,
     thinking_started: Option<Instant>,
@@ -156,6 +151,12 @@ struct AnswerWindow {
     closed_message: u32,
     generation: u64,
     streaming: bool,
+}
+
+impl AnswerWindow {
+    fn thinking_visible(&self) -> bool {
+        !self.thinking_complete || !self.reasoning.is_empty()
+    }
 }
 
 static REGISTERED: OnceLock<bool> = OnceLock::new();
@@ -186,7 +187,6 @@ impl Drop for AnswerWindow {
                 self.heading_font as _,
                 self.body_font as _,
                 self.hint_font as _,
-                self.answer_font as _,
                 self.window_brush,
                 self.answer_brush,
             ] {
@@ -255,9 +255,9 @@ pub(crate) fn show_ai_answer(
     light_theme: bool,
 ) -> Option<HWND> {
     show_answer_window(AnswerInit {
-        prompt: normalize_newlines(prompt),
-        answer: normalize_newlines(answer),
-        reasoning: normalize_newlines(reasoning),
+        prompt,
+        answer,
+        reasoning,
         owner,
         cancel_message: 0,
         closed_message: 0,
@@ -281,9 +281,9 @@ pub(crate) fn show_ai_stream(
     light_theme: bool,
 ) -> Option<HWND> {
     show_answer_window(AnswerInit {
-        prompt: normalize_newlines(prompt),
-        answer: String::new(),
-        reasoning: String::new(),
+        prompt,
+        answer: "",
+        reasoning: "",
         owner,
         cancel_message,
         closed_message,
@@ -295,7 +295,7 @@ pub(crate) fn show_ai_stream(
 }
 
 pub(crate) fn update_ai_status(window: HWND, status: &str) -> bool {
-    if window.is_null() || unsafe { IsWindow(window) } == 0 || status.is_empty() {
+    if status.is_empty() {
         return false;
     }
     with_answer_state(window, |state| {
@@ -308,7 +308,7 @@ pub(crate) fn update_ai_status(window: HWND, status: &str) -> bool {
     .unwrap_or(false)
 }
 
-fn show_answer_window(mut init: AnswerInit) -> Option<HWND> {
+fn show_answer_window(mut init: AnswerInit<'_>) -> Option<HWND> {
     if !*REGISTERED.get_or_init(register_window_class) {
         return None;
     }
@@ -396,16 +396,12 @@ fn clamp_window_rect(anchor: RECT, work: RECT, width: i32, height: i32) -> (i32,
 }
 
 pub(crate) fn append_ai_reasoning(window: HWND, text: &str) -> bool {
-    if window.is_null() || unsafe { IsWindow(window) } == 0 {
-        return false;
-    }
     with_answer_state(window, |state| {
         if !state.streaming || state.thinking_complete || text.is_empty() {
             return false;
         }
         if state.reasoning.is_empty() {
             state.thinking_started.get_or_insert_with(Instant::now);
-            state.thinking_visible = true;
         }
         state.reasoning.push_str(text);
         state.reasoning_chars = state.reasoning_chars.saturating_add(text.chars().count());
@@ -421,9 +417,6 @@ pub(crate) fn append_ai_reasoning(window: HWND, text: &str) -> bool {
 }
 
 pub(crate) fn append_ai_answer(window: HWND, text: &str) -> bool {
-    if window.is_null() || unsafe { IsWindow(window) } == 0 {
-        return false;
-    }
     with_answer_state(window, |state| {
         if !state.streaming {
             return false;
@@ -441,27 +434,15 @@ pub(crate) fn append_ai_answer(window: HWND, text: &str) -> bool {
 }
 
 pub(crate) fn finish_ai_answer(window: HWND, completion: AiCompletion) {
-    unsafe { set_stream_state(window, completion.status()) };
+    unsafe { set_stream_state(window, completion.status(), None) };
 }
 
 pub(crate) fn fail_ai_answer(window: HWND, error: &str) {
-    if window.is_null() || unsafe { IsWindow(window) } == 0 {
-        return;
-    }
-    let Some(empty) = with_answer_state(window, |state| state.answer.is_empty()) else {
-        return;
-    };
-    let message = if empty {
-        format!("请求失败：{error}")
-    } else {
-        format!("\n\n[请求中断] {error}")
-    };
-    append_ai_answer(window, &message);
-    unsafe { set_stream_state(window, "请求失败") };
+    unsafe { set_stream_state(window, "请求失败", Some(error)) };
 }
 
 pub(crate) fn cancel_ai_answer(window: HWND) {
-    unsafe { set_stream_state(window, "已停止生成") };
+    unsafe { set_stream_state(window, "已停止生成", None) };
 }
 
 pub(crate) fn close_ai_answer(window: HWND) {
@@ -557,7 +538,6 @@ unsafe extern "system" fn answer_window_proc(
                 }
                 STOP_BUTTON_ID => unsafe { notify_cancel(window) },
                 CLOSE_BUTTON_ID => unsafe {
-                    notify_cancel(window);
                     DestroyWindow(window);
                 },
                 _ => return unsafe { DefWindowProcW(window, message, wparam, lparam) },
@@ -615,10 +595,7 @@ unsafe extern "system" fn answer_window_proc(
         })
         .unwrap_or_else(|| unsafe { DefWindowProcW(window, message, wparam, lparam) }),
         WM_CLOSE => {
-            unsafe {
-                notify_cancel(window);
-                DestroyWindow(window);
-            }
+            unsafe { DestroyWindow(window) };
             0
         }
         WM_DESTROY => {
@@ -680,25 +657,22 @@ fn copy_answer(window: HWND, thinking: bool) {
 
 unsafe fn create_answer_window(window: HWND, lparam: LPARAM) -> LRESULT {
     let create = unsafe { &*(lparam as *const CREATESTRUCTW) };
-    let init = unsafe { &*(create.lpCreateParams as *const AnswerInit) };
+    let init = unsafe { &*(create.lpCreateParams as *const AnswerInit<'_>) };
     let dpi = unsafe { GetDpiForWindow(window) }.max(96);
-    let heading_font = create_font(dpi, 17, FW_SEMIBOLD);
-    let body_font = create_font(dpi, ANSWER_FONT_PIXELS, FW_NORMAL);
-    let hint_font = create_font(dpi, 14, FW_NORMAL);
-    let answer_font = create_font(dpi, ANSWER_FONT_PIXELS, FW_NORMAL);
+    let fonts = create_answer_fonts(dpi);
     let question_label = unsafe { create_static(window, "问题") };
-    let prompt = unsafe { create_static(window, &init.prompt) };
+    let prompt_text = normalize_newlines(init.prompt);
+    let prompt = unsafe { create_static(window, &prompt_text) };
     let answer_label = unsafe { create_static(window, "回答") };
     let (answer_edit, rich_edit) = unsafe { create_answer_edit(window) };
-    let thinking_toggle =
-        unsafe { create_button(window, "思考过程 · 等待模型输出", THINK_TOGGLE_ID) };
+    let thinking_toggle = unsafe { create_button(window, "", THINK_TOGGLE_ID) };
     let thinking_copy = unsafe { create_button(window, "复制思考", COPY_THINKING_ID) };
     let (thinking_edit, thinking_rich_edit) = unsafe { create_answer_edit(window) };
     let hint = unsafe { create_static(window, init.initial_status) };
     let copy_button = unsafe { create_button(window, "复制回答", COPY_BUTTON_ID) };
     let stop_button = unsafe { create_button(window, "停止生成", STOP_BUTTON_ID) };
     let close_button = unsafe { create_button(window, "关闭", CLOSE_BUTTON_ID) };
-    if [
+    let all_controls_ok = ![
         question_label,
         prompt,
         answer_label,
@@ -712,20 +686,13 @@ unsafe fn create_answer_window(window: HWND, lparam: LPARAM) -> LRESULT {
         close_button,
     ]
     .iter()
-    .any(|control| control.is_null())
-        || heading_font.is_null()
-        || body_font.is_null()
-        || hint_font.is_null()
-        || answer_font.is_null()
-    {
-        unsafe {
-            delete_font(heading_font);
-            delete_font(body_font);
-            delete_font(hint_font);
-            delete_font(answer_font);
+    .any(|control| control.is_null());
+    let Some((heading_font, body_font, hint_font)) = fonts.filter(|_| all_controls_ok) else {
+        if let Some((heading_font, body_font, hint_font)) = fonts {
+            unsafe { delete_fonts([heading_font, body_font, hint_font]) };
         }
         return -1;
-    }
+    };
     if !init.light_theme {
         let dark_control_theme = wide("DarkMode_Explorer");
         for control in [
@@ -740,9 +707,8 @@ unsafe fn create_answer_window(window: HWND, lparam: LPARAM) -> LRESULT {
             unsafe { SetWindowTheme(control, dark_control_theme.as_ptr(), null()) };
         }
     }
-    let reasoning = init.reasoning.replace("\r\n", "\n");
+    let reasoning = normalize_lf(init.reasoning);
     let reasoning_chars = reasoning.chars().count();
-    let thinking_visible = init.streaming || !reasoning.is_empty();
     let colors = answer_colors(init.light_theme);
     let state = AnswerWindow {
         question_label,
@@ -759,18 +725,16 @@ unsafe fn create_answer_window(window: HWND, lparam: LPARAM) -> LRESULT {
         heading_font,
         body_font,
         hint_font,
-        answer_font,
         window_brush: unsafe { CreateSolidBrush(colors.bg) },
         answer_brush: unsafe { CreateSolidBrush(colors.answer_bg) },
         colors,
-        answer: init.answer.replace("\r\n", "\n"),
+        answer: normalize_lf(init.answer),
         reasoning,
         reasoning_chars,
         rich_edit,
         thinking_rich_edit,
         render_dirty: false,
         thinking_dirty: false,
-        thinking_visible,
         thinking_expanded: false,
         thinking_complete: !init.streaming,
         thinking_started: None,
@@ -800,27 +764,7 @@ unsafe fn create_answer_window(window: HWND, lparam: LPARAM) -> LRESULT {
     });
     ANSWER_WINDOWS.with_borrow_mut(|windows| windows.insert(window, owner));
     with_answer_state(window, |state| unsafe {
-        for control in [state.question_label, state.answer_label] {
-            SendMessageW(control, WM_SETFONT, state.heading_font as WPARAM, 1);
-        }
-        SendMessageW(state.prompt, WM_SETFONT, state.body_font as WPARAM, 1);
-        SendMessageW(
-            state.answer_edit,
-            WM_SETFONT,
-            state.answer_font as WPARAM,
-            1,
-        );
-        for control in [
-            state.hint,
-            state.copy_button,
-            state.stop_button,
-            state.close_button,
-            state.thinking_toggle,
-            state.thinking_copy,
-            state.thinking_edit,
-        ] {
-            SendMessageW(control, WM_SETFONT, state.hint_font as WPARAM, 1);
-        }
+        apply_answer_fonts_and_margins(state, dpi);
         EnableWindow(state.stop_button, i32::from(state.streaming));
         ShowWindow(
             state.stop_button,
@@ -833,7 +777,7 @@ unsafe fn create_answer_window(window: HWND, lparam: LPARAM) -> LRESULT {
         EnableWindow(state.thinking_copy, i32::from(!state.reasoning.is_empty()));
         ShowWindow(
             state.thinking_toggle,
-            if state.thinking_visible {
+            if state.thinking_visible() {
                 SW_SHOW
             } else {
                 SW_HIDE
@@ -841,15 +785,6 @@ unsafe fn create_answer_window(window: HWND, lparam: LPARAM) -> LRESULT {
         );
         ShowWindow(state.thinking_copy, SW_HIDE);
         ShowWindow(state.thinking_edit, SW_HIDE);
-        let horizontal_margin = scale(12, dpi) as u32;
-        for edit in [state.answer_edit, state.thinking_edit] {
-            SendMessageW(
-                edit,
-                EM_SETMARGINS,
-                EC_LEFTMARGIN | EC_RIGHTMARGIN,
-                (horizontal_margin | (horizontal_margin << 16)) as LPARAM,
-            );
-        }
         render_answer(state, false);
         update_thinking_header(state);
         SetWindowSubclass(
@@ -861,7 +796,7 @@ unsafe fn create_answer_window(window: HWND, lparam: LPARAM) -> LRESULT {
         SetWindowSubclass(
             state.thinking_edit,
             Some(answer_edit_proc),
-            THINK_EDIT_SUBCLASS_ID,
+            EDIT_SUBCLASS_ID,
             window as usize,
         );
         for button in [
@@ -945,7 +880,7 @@ unsafe fn layout(window: HWND, state: &AnswerWindow) {
     let mut answer_heading_top = prompt_top + prompt_height + scale(9, dpi);
     let mut thinking_edit_top = 0;
     let mut thinking_edit_height = 0;
-    if state.thinking_visible {
+    if state.thinking_visible() {
         answer_heading_top = thinking_top + thinking_row_height + scale(8, dpi);
         if state.thinking_expanded {
             thinking_edit_top = thinking_top + thinking_row_height + scale(5, dpi);
@@ -1089,13 +1024,22 @@ unsafe fn notify_cancel(window: HWND) {
     }
 }
 
-unsafe fn set_stream_state(window: HWND, status: &str) {
+unsafe fn set_stream_state(window: HWND, status: &str, failure_error: Option<&str>) {
     with_answer_state(window, |state| {
         if !state.streaming {
             return;
         }
 
         unsafe { complete_thinking(window, state) };
+        if let Some(error) = failure_error {
+            if state.answer.is_empty() {
+                state.answer.push_str("请求失败：");
+            } else {
+                state.answer.push_str("\n\n[请求中断] ");
+            }
+            state.answer.push_str(error);
+            unsafe { SetWindowTextW(state.copy_button, wide("复制回答").as_ptr()) };
+        }
         state.streaming = false;
         // The last streaming paint is intentionally plain text. Always perform one
         // final Markdown pass, even if no delta arrived since the previous timer.
@@ -1181,9 +1125,9 @@ unsafe fn complete_thinking(window: HWND, state: &mut AnswerWindow) {
     state.thinking_elapsed_ms = state
         .thinking_started
         .map(|started| started.elapsed().as_millis());
-    unsafe { flush_thinking_render(window, state) };
     if state.reasoning.is_empty() {
-        state.thinking_visible = false;
+        unsafe { KillTimer(window, THINK_RENDER_TIMER_ID) };
+        state.thinking_dirty = false;
         state.thinking_expanded = false;
         unsafe {
             ShowWindow(state.thinking_toggle, SW_HIDE);
@@ -1191,8 +1135,7 @@ unsafe fn complete_thinking(window: HWND, state: &mut AnswerWindow) {
             ShowWindow(state.thinking_edit, SW_HIDE);
         }
     } else {
-        state.thinking_visible = true;
-        unsafe { update_thinking_header(state) };
+        unsafe { flush_thinking_render(window, state) };
     }
     unsafe { layout(window, state) };
 }
@@ -1324,51 +1267,25 @@ unsafe fn create_static(parent: HWND, text: &str) -> HWND {
     }
 }
 
-unsafe fn apply_answer_dpi(window: HWND, dpi: u32) {
-    let Some(shared) = answer_window_state(window) else {
-        return;
-    };
-    let heading_font = create_font(dpi, 17, FW_SEMIBOLD);
-    let body_font = create_font(dpi, ANSWER_FONT_PIXELS, FW_NORMAL);
-    let hint_font = create_font(dpi, 14, FW_NORMAL);
-    let answer_font = create_font(dpi, ANSWER_FONT_PIXELS, FW_NORMAL);
-    if heading_font.is_null() || body_font.is_null() || hint_font.is_null() || answer_font.is_null()
-    {
-        unsafe {
-            delete_font(heading_font);
-            delete_font(body_font);
-            delete_font(hint_font);
-            delete_font(answer_font);
-        }
-        return;
+fn create_answer_fonts(dpi: u32) -> Option<(HFONT, HFONT, HFONT)> {
+    let heading_font = create_ui_font(dpi, 17, FW_SEMIBOLD);
+    let body_font = create_ui_font(dpi, ANSWER_FONT_PIXELS, FW_NORMAL);
+    let hint_font = create_ui_font(dpi, 14, FW_NORMAL);
+    if heading_font.is_null() || body_font.is_null() || hint_font.is_null() {
+        unsafe { delete_fonts([heading_font, body_font, hint_font]) };
+        return None;
     }
-    let Ok(mut state) = shared.model.try_borrow_mut() else {
-        unsafe {
-            delete_font(heading_font);
-            delete_font(body_font);
-            delete_font(hint_font);
-            delete_font(answer_font);
-        }
-        return;
-    };
-    let old_fonts = [
-        std::mem::replace(&mut state.heading_font, heading_font),
-        std::mem::replace(&mut state.body_font, body_font),
-        std::mem::replace(&mut state.hint_font, hint_font),
-        std::mem::replace(&mut state.answer_font, answer_font),
-    ];
-    shared.paint.hint_font.set(hint_font);
+    Some((heading_font, body_font, hint_font))
+}
+
+unsafe fn apply_answer_fonts_and_margins(state: &AnswerWindow, dpi: u32) {
     unsafe {
         for control in [state.question_label, state.answer_label] {
             SendMessageW(control, WM_SETFONT, state.heading_font as WPARAM, 1);
         }
-        SendMessageW(state.prompt, WM_SETFONT, state.body_font as WPARAM, 1);
-        SendMessageW(
-            state.answer_edit,
-            WM_SETFONT,
-            state.answer_font as WPARAM,
-            1,
-        );
+        for control in [state.prompt, state.answer_edit] {
+            SendMessageW(control, WM_SETFONT, state.body_font as WPARAM, 1);
+        }
         for control in [
             state.hint,
             state.copy_button,
@@ -1385,13 +1302,33 @@ unsafe fn apply_answer_dpi(window: HWND, dpi: u32) {
             SendMessageW(
                 edit,
                 EM_SETMARGINS,
-                EC_LEFTMARGIN | EC_RIGHTMARGIN,
+                (EC_LEFTMARGIN | EC_RIGHTMARGIN) as WPARAM,
                 (horizontal_margin | (horizontal_margin << 16)) as LPARAM,
             );
         }
-        for font in old_fonts {
-            delete_font(font);
-        }
+    }
+}
+
+unsafe fn apply_answer_dpi(window: HWND, dpi: u32) {
+    let Some(shared) = answer_window_state(window) else {
+        return;
+    };
+    let Some((heading_font, body_font, hint_font)) = create_answer_fonts(dpi) else {
+        return;
+    };
+    let Ok(mut state) = shared.model.try_borrow_mut() else {
+        unsafe { delete_fonts([heading_font, body_font, hint_font]) };
+        return;
+    };
+    let old_fonts = [
+        std::mem::replace(&mut state.heading_font, heading_font),
+        std::mem::replace(&mut state.body_font, body_font),
+        std::mem::replace(&mut state.hint_font, hint_font),
+    ];
+    shared.paint.hint_font.set(hint_font);
+    unsafe {
+        apply_answer_fonts_and_margins(&state, dpi);
+        delete_fonts(old_fonts);
         layout(window, &state);
         InvalidateRect(window, null(), 1);
     }
@@ -1506,42 +1443,20 @@ unsafe fn draw_button(draw: &DRAWITEMSTRUCT, state: &AnswerPaint) {
     }
 }
 
-fn create_font(dpi: u32, pixels: i32, weight: u32) -> HFONT {
-    unsafe {
-        CreateFontW(
-            scale(-pixels, dpi),
-            0,
-            0,
-            0,
-            weight as i32,
-            0,
-            0,
-            0,
-            DEFAULT_CHARSET as u32,
-            OUT_DEFAULT_PRECIS as u32,
-            CLIP_DEFAULT_PRECIS as u32,
-            CLEARTYPE_QUALITY as u32,
-            FF_DONTCARE as u32,
-            wide("Microsoft YaHei UI").as_ptr(),
-        )
+unsafe fn delete_fonts(fonts: [HFONT; 3]) {
+    for font in fonts {
+        if !font.is_null() {
+            unsafe { DeleteObject(font as _) };
+        }
     }
 }
 
-unsafe fn delete_font(font: HFONT) {
-    if !font.is_null() {
-        unsafe { DeleteObject(font as _) };
-    }
+fn normalize_lf(value: &str) -> String {
+    value.replace("\r\n", "\n").replace('\r', "\n")
 }
 
 fn normalize_newlines(value: &str) -> String {
-    value
-        .replace("\r\n", "\n")
-        .replace('\r', "\n")
-        .replace('\n', "\r\n")
-}
-
-fn scale(value: i32, dpi: u32) -> i32 {
-    value * dpi as i32 / 96
+    normalize_lf(value).replace('\n', "\r\n")
 }
 
 #[cfg(test)]

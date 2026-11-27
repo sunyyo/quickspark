@@ -5,7 +5,10 @@ use crate::{
     storage::commands_file,
 };
 
-use super::{Provider, ProviderContext, ProviderOutput, web_search::url_encode};
+use super::{
+    Provider, ProviderContext, ProviderOutput, split_first_term, strip_prefix_ascii_case,
+    web_search::url_encode,
+};
 
 const PROVIDER_ID: &str = "commands";
 
@@ -21,11 +24,18 @@ impl Provider for CommandProvider {
             return ProviderOutput::empty();
         };
         let Some(path) = commands_file() else {
-            return message("无法创建自定义指令配置文件", Vec::new());
+            return ProviderOutput::exclusive_item(
+                PROVIDER_ID,
+                "无法创建自定义指令配置文件",
+                100_000,
+                Vec::new(),
+            );
         };
         if terms.eq_ignore_ascii_case("edit") || terms == "编辑" {
-            return message(
+            return ProviderOutput::exclusive_item(
+                PROVIDER_ID,
                 "打开 commands.txt 编辑自定义指令",
+                100_000,
                 vec![Action::OpenPath { path }],
             );
         }
@@ -35,28 +45,29 @@ impl Provider for CommandProvider {
             .map(|text| parse_commands(&text))
             .unwrap_or_default();
         if commands.is_empty() {
-            return message(
+            return ProviderOutput::exclusive_item(
+                PROVIDER_ID,
                 "尚未添加自定义指令；按 Enter 打开 commands.txt",
+                100_000,
                 vec![Action::OpenPath { path }],
             );
         }
 
         let results = match_commands(&commands, terms);
         if results.is_empty() {
-            return message(
-                &format!("没有找到“{terms}”指令；输入 ; edit 编辑配置"),
+            return ProviderOutput::exclusive_item(
+                PROVIDER_ID,
+                format!("没有找到“{terms}”指令；输入 ; edit 编辑配置"),
+                100_000,
                 vec![Action::OpenPath { path }],
             );
         }
-        ProviderOutput {
-            results,
-            exclusive: true,
-        }
+        ProviderOutput::exclusive(results)
     }
 }
 
 fn match_commands(commands: &[CustomCommand], terms: &str) -> Vec<ResultItem> {
-    let (alias, arguments) = split_command_terms(terms);
+    let (alias, arguments) = split_first_term(terms);
     let exact = commands
         .iter()
         .any(|command| command.alias.eq_ignore_ascii_case(alias));
@@ -131,12 +142,6 @@ fn commands_query(input: &str) -> Option<&str> {
     input.strip_prefix(';').map(str::trim)
 }
 
-fn split_command_terms(terms: &str) -> (&str, &str) {
-    terms
-        .split_once(char::is_whitespace)
-        .map_or((terms, ""), |(alias, arguments)| (alias, arguments.trim()))
-}
-
 fn command_action(command: &CustomCommand, arguments: &str) -> Action {
     let expanded = expand_environment(&command.target);
     let trimmed = expanded.trim();
@@ -157,13 +162,6 @@ fn command_action(command: &CustomCommand, arguments: &str) -> Action {
     } else {
         Action::OpenTarget { target }
     }
-}
-
-fn strip_prefix_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
-    value
-        .get(..prefix.len())
-        .filter(|candidate| candidate.eq_ignore_ascii_case(prefix))
-        .map(|_| &value[prefix.len()..])
 }
 
 fn expand_environment(value: &str) -> String {
@@ -188,18 +186,6 @@ fn expand_environment(value: &str) -> String {
     }
     expanded.push_str(remaining);
     expanded
-}
-
-fn message(title: &str, actions: Vec<Action>) -> ProviderOutput {
-    ProviderOutput {
-        results: vec![ResultItem {
-            provider_id: PROVIDER_ID,
-            title: title.to_owned(),
-            score: 100_000,
-            actions,
-        }],
-        exclusive: true,
-    }
 }
 
 #[cfg(test)]

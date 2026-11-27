@@ -1,6 +1,6 @@
 use crate::model::{Action, Query, ResultItem, SystemCommand};
 
-use super::{Provider, ProviderContext, ProviderOutput};
+use super::{Provider, ProviderContext, ProviderOutput, matches_all_terms, strip_keyword_prefix};
 
 const PROVIDER_ID: &str = "system";
 
@@ -30,20 +30,15 @@ impl Provider for SystemProvider {
                 actions: vec![entry.action],
             })
             .collect::<Vec<_>>();
-        let results = if results.is_empty() {
-            vec![ResultItem {
-                provider_id: PROVIDER_ID,
-                title: format!("没有找到“{terms}”相关系统项目"),
-                score: 100_000,
-                actions: Vec::new(),
-            }]
-        } else {
-            results
-        };
-        ProviderOutput {
-            results,
-            exclusive: true,
+        if results.is_empty() {
+            return ProviderOutput::exclusive_item(
+                PROVIDER_ID,
+                format!("没有找到“{terms}”相关系统项目"),
+                100_000,
+                Vec::new(),
+            );
         }
+        ProviderOutput::exclusive(results)
     }
 }
 
@@ -61,14 +56,7 @@ struct SystemEntry {
 
 impl SystemEntry {
     fn matches(&self, terms: &str) -> bool {
-        if terms.is_empty() {
-            return true;
-        }
-        let searchable = format!("{} {}", self.title, self.keywords).to_lowercase();
-        terms
-            .to_lowercase()
-            .split_whitespace()
-            .all(|term| searchable.contains(term))
+        matches_all_terms(&[self.title, self.keywords], terms)
     }
 }
 
@@ -181,18 +169,8 @@ fn system_query(input: &str) -> Option<(QueryMode, &str)> {
     if let Some(terms) = input.strip_prefix('$') {
         return Some((QueryMode::Settings, terms.trim()));
     }
-    if ["sys", "system", "系统"]
-        .iter()
-        .any(|prefix| input.eq_ignore_ascii_case(prefix))
-    {
-        return Some((QueryMode::Commands, ""));
-    }
-    let split_at = input.find(char::is_whitespace)?;
-    let (prefix, terms) = input.split_at(split_at);
-    ["sys", "system", "系统"]
-        .iter()
-        .any(|candidate| prefix.eq_ignore_ascii_case(candidate))
-        .then_some((QueryMode::Commands, terms.trim()))
+    strip_keyword_prefix(input, &["sys", "system", "系统"])
+        .map(|terms| (QueryMode::Commands, terms))
 }
 
 #[cfg(test)]

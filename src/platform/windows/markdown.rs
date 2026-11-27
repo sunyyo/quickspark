@@ -117,17 +117,17 @@ fn render_line(line: &str, builder: &mut Builder) {
         return;
     }
 
-    if let Some(content) =
-        checkbox_item(trimmed, "- [ ] ").or_else(|| checkbox_item(trimmed, "* [ ] "))
+    if let Some(content) = trimmed
+        .strip_prefix("- [ ] ")
+        .or_else(|| trimmed.strip_prefix("* [ ] "))
     {
         builder.push("☐  ");
         render_inline(content, builder);
         return;
     }
-    if let Some(content) = checkbox_item(trimmed, "- [x] ")
-        .or_else(|| checkbox_item(trimmed, "- [X] "))
-        .or_else(|| checkbox_item(trimmed, "* [x] "))
-        .or_else(|| checkbox_item(trimmed, "* [X] "))
+    if let Some(content) = ["- [x] ", "- [X] ", "* [x] ", "* [X] "]
+        .into_iter()
+        .find_map(|prefix| trimmed.strip_prefix(prefix))
     {
         builder.push("☑  ");
         render_inline(content, builder);
@@ -167,10 +167,6 @@ fn heading(line: &str) -> Option<(u8, &str)> {
         count as u8,
         line[count + 1..].trim_end_matches('#').trim_end(),
     ))
-}
-
-fn checkbox_item<'a>(line: &'a str, prefix: &str) -> Option<&'a str> {
-    line.strip_prefix(prefix)
 }
 
 fn is_horizontal_rule(line: &str) -> bool {

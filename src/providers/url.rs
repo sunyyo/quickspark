@@ -1,8 +1,8 @@
 use std::net::{IpAddr, Ipv6Addr};
 
-use crate::model::{Action, Query, ResultItem};
+use crate::model::{Action, Query};
 
-use super::{Provider, ProviderContext, ProviderOutput};
+use super::{Provider, ProviderContext, ProviderOutput, strip_prefix_ascii_case, truncate_chars};
 
 const MAX_URL_CHARS: usize = 8_192;
 
@@ -18,19 +18,15 @@ impl Provider for UrlProvider {
             return ProviderOutput::empty();
         };
 
-        let title = format!("使用默认浏览器打开：{}", preview(&url));
-        ProviderOutput {
-            results: vec![ResultItem {
-                provider_id: self.id(),
-                title,
-                score: 100_000,
-                actions: vec![
-                    Action::OpenUrl { url: url.clone() },
-                    Action::CopyText { text: url },
-                ],
-            }],
-            exclusive: true,
-        }
+        ProviderOutput::exclusive_item(
+            self.id(),
+            format!("使用默认浏览器打开：{}", truncate_chars(&url, 100)),
+            100_000,
+            vec![
+                Action::OpenUrl { url: url.clone() },
+                Action::CopyText { text: url },
+            ],
+        )
     }
 }
 
@@ -67,13 +63,6 @@ fn direct_url(raw: &str) -> Option<String> {
     }
 
     valid_authority(authority).then_some(url)
-}
-
-fn strip_prefix_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
-    value
-        .get(..prefix.len())
-        .filter(|candidate| candidate.eq_ignore_ascii_case(prefix))
-        .map(|_| &value[prefix.len()..])
 }
 
 fn valid_authority(authority: &str) -> bool {
@@ -141,17 +130,6 @@ fn valid_host_label(label: &str) -> bool {
         && label
             .chars()
             .all(|character| character.is_alphanumeric() || character == '-')
-}
-
-fn preview(url: &str) -> String {
-    const MAX_PREVIEW_CHARS: usize = 100;
-
-    let mut characters = url.chars();
-    let mut preview: String = characters.by_ref().take(MAX_PREVIEW_CHARS).collect();
-    if characters.next().is_some() {
-        preview.push('…');
-    }
-    preview
 }
 
 #[cfg(test)]

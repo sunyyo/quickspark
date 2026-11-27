@@ -10,11 +10,11 @@ use std::{
 
 use serde_json::{Value, json};
 use windows_sys::Win32::Networking::WinHttp::{
-    WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_DISABLE_REDIRECTS, WINHTTP_FLAG_SECURE,
-    WINHTTP_OPTION_DISABLE_FEATURE, WINHTTP_QUERY_FLAG_NUMBER, WINHTTP_QUERY_STATUS_CODE,
-    WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest, WinHttpQueryDataAvailable,
-    WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse, WinHttpSendRequest,
-    WinHttpSetOption, WinHttpSetTimeouts,
+    WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, WINHTTP_ACCESS_TYPE_NO_PROXY, WINHTTP_DISABLE_REDIRECTS,
+    WINHTTP_FLAG_SECURE, WINHTTP_OPTION_DISABLE_FEATURE, WINHTTP_QUERY_FLAG_NUMBER,
+    WINHTTP_QUERY_STATUS_CODE, WinHttpCloseHandle, WinHttpConnect, WinHttpOpen, WinHttpOpenRequest,
+    WinHttpQueryDataAvailable, WinHttpQueryHeaders, WinHttpReadData, WinHttpReceiveResponse,
+    WinHttpSendRequest, WinHttpSetOption, WinHttpSetTimeouts,
 };
 
 use crate::{
@@ -93,11 +93,7 @@ pub(super) fn agent_request_body(config: &AiConfig, system: &str, prompt: &str) 
 pub(super) fn extract_response(bytes: &[u8]) -> Result<AiResponse, String> {
     let value: Value = serde_json::from_slice(bytes)
         .map_err(|error| format!("接口返回的不是有效 JSON：{error}"))?;
-    if let Some(message) = value
-        .get("error")
-        .and_then(|error| error.get("message"))
-        .and_then(Value::as_str)
-    {
+    if let Some(message) = json_error_message(&value) {
         return Err(message.to_owned());
     }
     let choice = value
@@ -134,7 +130,7 @@ pub(super) fn winhttp_stream_json<F>(
     config: &AiConfig,
     api_key: &str,
     body: &[u8],
-    context: RequestContext,
+    context: &RequestContext,
     mut on_delta: F,
 ) -> Result<AiResponse, String>
 where
@@ -145,19 +141,14 @@ where
         api_key,
         body,
         config.timeout_seconds,
-        &context,
+        context,
         "AI",
         "text/event-stream, application/json",
     )?;
-    let status = response_status(request.handle.0)?;
+    let status = response_status(request.handle.0, "AI")?;
     if !(200..300).contains(&status) {
-        let response = read_response(request.handle.0, &context)?;
-        let details = api_error_message(&response);
-        return Err(if details.is_empty() {
-            format!("AI 接口返回 HTTP {status}")
-        } else {
-            format!("AI 接口返回 HTTP {status}：{details}")
-        });
+        let response = read_response(request.handle.0, context, "AI")?;
+        return Err(http_status_error("AI", status, &response));
     }
 
     let mut raw_response = Vec::new();
@@ -172,27 +163,20 @@ where
             for frame in frames {
                 *saw_sse = true;
                 match frame {
-                    StreamFrame::Reasoning(text) => {
+                    StreamFrame::Reasoning(text) | StreamFrame::Answer(text)
                         if answer
                             .len()
                             .saturating_add(reasoning.len())
                             .saturating_add(text.len())
-                            > MAX_RESPONSE_BYTES
-                        {
-                            return Err("AI 响应超过 4 MB 安全上限".to_owned());
-                        }
+                            > MAX_RESPONSE_BYTES =>
+                    {
+                        return Err("AI 响应超过 4 MB 安全上限".to_owned());
+                    }
+                    StreamFrame::Reasoning(text) => {
                         reasoning.push_str(&text);
                         on_delta(StreamDelta::Reasoning(text));
                     }
                     StreamFrame::Answer(text) => {
-                        if answer
-                            .len()
-                            .saturating_add(reasoning.len())
-                            .saturating_add(text.len())
-                            > MAX_RESPONSE_BYTES
-                        {
-                            return Err("AI 响应超过 4 MB 安全上限".to_owned());
-                        }
                         answer.push_str(&text);
                         on_delta(StreamDelta::Answer(text));
                     }
@@ -203,7 +187,7 @@ where
             Ok(ControlFlow::Continue(()))
         };
     let mut done = false;
-    read_response_chunks(request.handle.0, |chunk| {
+    read_response_chunks(request.handle.0, "AI", |chunk| {
         context.ensure_current()?;
         wire_bytes = wire_bytes
             .checked_add(chunk.len())
@@ -277,7 +261,7 @@ pub(super) fn winhttp_json(
     api_key: &str,
     body: &[u8],
     timeout_seconds: u32,
-    context: RequestContext,
+    context: &RequestContext,
     service_name: &str,
 ) -> Result<Vec<u8>, String> {
     let request = post_json(
@@ -285,31 +269,14 @@ pub(super) fn winhttp_json(
         api_key,
         body,
         timeout_seconds,
-        &context,
+        context,
         service_name,
         "application/json",
     )?;
-    let status = response_status(request.handle.0)?;
-    let mut response = Vec::new();
-    read_response_chunks(request.handle.0, |chunk| {
-        context.ensure_current()?;
-        let new_len = response
-            .len()
-            .checked_add(chunk.len())
-            .ok_or_else(|| format!("{service_name} 响应过大"))?;
-        if new_len > MAX_RESPONSE_BYTES {
-            return Err(format!("{service_name} 响应超过 4 MB 安全上限"));
-        }
-        response.extend_from_slice(chunk);
-        Ok(ControlFlow::Continue(()))
-    })?;
+    let status = response_status(request.handle.0, service_name)?;
+    let response = read_response(request.handle.0, context, service_name)?;
     if !(200..300).contains(&status) {
-        let details = api_error_message(&response);
-        return Err(if details.is_empty() {
-            format!("{service_name} 接口返回 HTTP {status}")
-        } else {
-            format!("{service_name} 接口返回 HTTP {status}：{details}")
-        });
+        return Err(http_status_error(service_name, status, &response));
     }
     Ok(response)
 }
@@ -331,16 +298,27 @@ fn post_json(
     accept: &str,
 ) -> Result<HttpRequest, String> {
     let parsed = ParsedUrl::parse(url)?;
+    let mut headers = format!("Content-Type: application/json\r\nAccept: {accept}\r\n");
+    let api_key = api_key.trim();
+    if !api_key.is_empty() {
+        if api_key.chars().any(char::is_control) {
+            return Err(format!(
+                "{service_name} API Key 包含无效控制字符，请重新设置"
+            ));
+        }
+        headers.push_str("Authorization: Bearer ");
+        headers.push_str(api_key);
+        headers.push_str("\r\n");
+    }
     context.ensure_current()?;
     let user_agent = wide(concat!("QuickSpark/", env!("CARGO_PKG_VERSION")));
+    let access_type = if parsed.is_loopback() {
+        WINHTTP_ACCESS_TYPE_NO_PROXY
+    } else {
+        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY
+    };
     let session = InternetHandle::new(unsafe {
-        WinHttpOpen(
-            user_agent.as_ptr(),
-            WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
-            null(),
-            null(),
-            0,
-        )
+        WinHttpOpen(user_agent.as_ptr(), access_type, null(), null(), 0)
     })
     .ok_or_else(|| last_error("无法初始化 WinHTTP"))?;
     let timeout = i32::try_from(timeout_seconds.saturating_mul(1_000)).unwrap_or(i32::MAX);
@@ -386,18 +364,6 @@ fn post_json(
             "无法禁用 {service_name} 请求自动重定向"
         )));
     }
-    let mut headers = format!("Content-Type: application/json\r\nAccept: {accept}\r\n");
-    let api_key = api_key.trim();
-    if !api_key.is_empty() {
-        if api_key.chars().any(char::is_control) {
-            return Err(format!(
-                "{service_name} API Key 包含无效控制字符，请重新设置"
-            ));
-        }
-        headers.push_str("Authorization: Bearer ");
-        headers.push_str(api_key);
-        headers.push_str("\r\n");
-    }
     let headers = wide(&headers);
     if unsafe {
         WinHttpSendRequest(
@@ -425,7 +391,7 @@ fn post_json(
     })
 }
 
-fn response_status(request: *mut c_void) -> Result<u32, String> {
+fn response_status(request: *mut c_void, service_name: &str) -> Result<u32, String> {
     let mut status = 0u32;
     let mut size = std::mem::size_of::<u32>() as u32;
     if unsafe {
@@ -439,21 +405,25 @@ fn response_status(request: *mut c_void) -> Result<u32, String> {
         )
     } == 0
     {
-        return Err(last_error("无法读取 AI 接口状态码"));
+        return Err(last_error(&format!("无法读取 {service_name} 接口状态码")));
     }
     Ok(status)
 }
 
-fn read_response(request: *mut c_void, context: &RequestContext) -> Result<Vec<u8>, String> {
+fn read_response(
+    request: *mut c_void,
+    context: &RequestContext,
+    service_name: &str,
+) -> Result<Vec<u8>, String> {
     let mut response = Vec::new();
-    read_response_chunks(request, |chunk| {
+    read_response_chunks(request, service_name, |chunk| {
         context.ensure_current()?;
         let new_len = response
             .len()
             .checked_add(chunk.len())
-            .ok_or_else(|| "AI 响应过大".to_owned())?;
+            .ok_or_else(|| format!("{service_name} 响应过大"))?;
         if new_len > MAX_RESPONSE_BYTES {
-            return Err("AI 响应超过 4 MB 安全上限".to_owned());
+            return Err(format!("{service_name} 响应超过 4 MB 安全上限"));
         }
         response.extend_from_slice(chunk);
         Ok(ControlFlow::Continue(()))
@@ -461,14 +431,18 @@ fn read_response(request: *mut c_void, context: &RequestContext) -> Result<Vec<u
     Ok(response)
 }
 
-fn read_response_chunks<F>(request: *mut c_void, mut on_chunk: F) -> Result<(), String>
+fn read_response_chunks<F>(
+    request: *mut c_void,
+    service_name: &str,
+    mut on_chunk: F,
+) -> Result<(), String>
 where
     F: FnMut(&[u8]) -> Result<ControlFlow<()>, String>,
 {
     loop {
         let mut available = 0u32;
         if unsafe { WinHttpQueryDataAvailable(request, &mut available) } == 0 {
-            return Err(last_error("读取 AI 响应长度失败"));
+            return Err(last_error(&format!("读取 {service_name} 响应长度失败")));
         }
         if available == 0 {
             break;
@@ -479,7 +453,7 @@ where
         let mut chunk = vec![0u8; requested as usize];
         let mut read = 0u32;
         if unsafe { WinHttpReadData(request, chunk.as_mut_ptr() as _, requested, &mut read) } == 0 {
-            return Err(last_error("读取 AI 响应内容失败"));
+            return Err(last_error(&format!("读取 {service_name} 响应内容失败")));
         }
         if read == 0 {
             break;
@@ -491,12 +465,25 @@ where
     Ok(())
 }
 
+pub(super) fn json_error_message(value: &Value) -> Option<&str> {
+    value
+        .get("error")
+        .and_then(|error| error.get("message").or(Some(error)))
+        .and_then(Value::as_str)
+}
+
+fn http_status_error(service_name: &str, status: u32, response: &[u8]) -> String {
+    let details = api_error_message(response);
+    if details.is_empty() {
+        format!("{service_name} 接口返回 HTTP {status}")
+    } else {
+        format!("{service_name} 接口返回 HTTP {status}：{details}")
+    }
+}
+
 fn api_error_message(bytes: &[u8]) -> String {
     if let Ok(value) = serde_json::from_slice::<Value>(bytes)
-        && let Some(message) = value
-            .get("error")
-            .and_then(|error| error.get("message").or(Some(error)))
-            .and_then(Value::as_str)
+        && let Some(message) = json_error_message(&value)
     {
         return preview(message, 240);
     }
@@ -506,7 +493,6 @@ fn api_error_message(bytes: &[u8]) -> String {
         .unwrap_or_default()
 }
 
-#[derive(Clone)]
 pub(super) struct RequestContext {
     pub(super) current_generation: Arc<AtomicU64>,
     pub(super) generation: u64,
@@ -577,7 +563,7 @@ fn parse_sse_line(line: &[u8]) -> Result<Vec<StreamFrame>, String> {
     let Some(data) = line.strip_prefix(b"data:") else {
         return Ok(Vec::new());
     };
-    let data = trim_ascii(data);
+    let data = data.trim_ascii();
     if data == b"[DONE]" {
         return Ok(vec![StreamFrame::Done]);
     }
@@ -586,11 +572,7 @@ fn parse_sse_line(line: &[u8]) -> Result<Vec<StreamFrame>, String> {
     }
     let value: Value =
         serde_json::from_slice(data).map_err(|error| format!("无法解析 AI 流式数据：{error}"))?;
-    if let Some(message) = value
-        .get("error")
-        .and_then(|error| error.get("message").or(Some(error)))
-        .and_then(Value::as_str)
-    {
+    if let Some(message) = json_error_message(&value) {
         return Err(message.to_owned());
     }
     let Some(choice) = value
@@ -640,16 +622,6 @@ fn content_text(content: &Value) -> String {
             .join(""),
         _ => String::new(),
     }
-}
-
-fn trim_ascii(mut value: &[u8]) -> &[u8] {
-    while value.first().is_some_and(u8::is_ascii_whitespace) {
-        value = &value[1..];
-    }
-    while value.last().is_some_and(u8::is_ascii_whitespace) {
-        value = &value[..value.len() - 1];
-    }
-    value
 }
 
 struct InternetHandle(*mut c_void);

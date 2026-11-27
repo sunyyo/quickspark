@@ -2,7 +2,11 @@ use std::collections::HashSet;
 
 use serde_json::{Value, json};
 
-use super::transport::{RequestContext, winhttp_json};
+use super::{
+    preview,
+    transport::{RequestContext, json_error_message, winhttp_json},
+};
+use crate::providers::truncate_chars;
 
 const ENDPOINT: &str = "https://api.tavily.com/search";
 const MAX_QUERY_CHARS: usize = 400;
@@ -19,7 +23,7 @@ pub(super) fn search(
     query: &str,
     api_key: &str,
     timeout_seconds: u32,
-    context: RequestContext,
+    context: &RequestContext,
 ) -> Result<Vec<SearchSource>, String> {
     if api_key.trim().is_empty() {
         return Err(
@@ -50,14 +54,10 @@ fn search_body(query: &str) -> Vec<u8> {
     .unwrap_or_default()
 }
 
-pub(super) fn extract_sources(bytes: &[u8]) -> Result<Vec<SearchSource>, String> {
+fn extract_sources(bytes: &[u8]) -> Result<Vec<SearchSource>, String> {
     let value: Value = serde_json::from_slice(bytes)
         .map_err(|error| format!("Tavily 返回的不是有效 JSON：{error}"))?;
-    if let Some(message) = value
-        .get("error")
-        .and_then(|error| error.get("message").or(Some(error)))
-        .and_then(Value::as_str)
-    {
+    if let Some(message) = json_error_message(&value) {
         return Err(message.to_owned());
     }
     let results = value
@@ -83,34 +83,21 @@ pub(super) fn extract_sources(bytes: &[u8]) -> Result<Vec<SearchSource>, String>
         let title = result
             .get("title")
             .and_then(Value::as_str)
-            .map(flatten)
+            .map(|title| preview(title, 240))
             .filter(|title| !title.is_empty())
-            .unwrap_or_else(|| url.to_owned());
+            .unwrap_or_else(|| truncate_chars(url, 240));
         let content = result
             .get("content")
             .and_then(Value::as_str)
-            .map(flatten)
+            .map(|content| preview(content, MAX_SOURCE_CONTENT_CHARS))
             .unwrap_or_default();
         sources.push(SearchSource {
-            title: truncate_chars(&title, 240),
+            title,
             url: url.to_owned(),
-            content: truncate_chars(&content, MAX_SOURCE_CONTENT_CHARS),
+            content,
         });
     }
     Ok(sources)
-}
-
-fn flatten(value: &str) -> String {
-    value.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn truncate_chars(value: &str, limit: usize) -> String {
-    let mut chars = value.chars();
-    let mut output = chars.by_ref().take(limit).collect::<String>();
-    if chars.next().is_some() {
-        output.push('…');
-    }
-    output
 }
 
 #[cfg(test)]

@@ -9,7 +9,7 @@ use crate::{
         WebSearchProvider,
         applications::{
             Entry, EntryTarget, entry_score, is_blocked_tool, is_noise_entry, is_system_setting,
-            is_uninstaller, is_user_blocked, parse_start_apps,
+            is_uninstaller, matches_patterns, parse_start_apps,
         },
         web_search::{parse_web_searches, url_encode},
     },
@@ -21,7 +21,6 @@ use std::{
     collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
 };
 
 #[test]
@@ -295,12 +294,8 @@ fn start_apps_parser_keeps_only_packaged_app_ids() {
 
 #[test]
 fn usage_file_round_trips_and_skips_invalid_rows() {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
-    let dir = std::env::temp_dir().join(format!("quickspark-test-{}-{unique}", std::process::id()));
-    let path = dir.join("usage.tsv");
+    let dir = crate::storage::TestTempDir::new("quickspark-test");
+    let path = dir.path().join("usage.tsv");
     let mut expected = HashMap::new();
     expected.insert(
         "obsidian".into(),
@@ -318,7 +313,6 @@ fn usage_file_round_trips_and_skips_invalid_rows() {
     let recovered = load_usage_from(&path);
     assert_eq!(recovered.len(), 1);
     assert_eq!(recovered["valid"].count, 2);
-    let _ = fs::remove_dir_all(dir);
 }
 
 #[test]
@@ -487,147 +481,175 @@ fn filters_sdk_noise_paths_and_user_patterns() {
         "Some Utility",
         Path::new(r"C:\Program Files\Windows Kits\10\bin")
     ));
-    assert!(is_user_blocked("Example Helper", &["helper".into()]));
-    assert!(!is_user_blocked("Example Player", &["helper".into()]));
+    assert!(matches_patterns("Example Helper", &["helper".into()]));
+    assert!(!matches_patterns("Example Player", &["helper".into()]));
+}
+
+struct TestWindowGuard(super::HWND);
+
+impl Drop for TestWindowGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                super::SetWindowLongPtrW(self.0, super::GWLP_USERDATA, 0);
+                super::DestroyWindow(self.0);
+            }
+        }
+    }
+}
+
+struct AiAnswerGuard(super::HWND);
+
+impl Drop for AiAnswerGuard {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            super::close_ai_answer(self.0);
+        }
+    }
 }
 
 #[test]
 fn background_refresh_and_shortcuts_respect_the_current_result_and_window() {
-    use super::*;
-    let control = |class: &str, parent, style| unsafe {
-        CreateWindowExW(
-            0,
-            wide(class).as_ptr(),
-            null(),
-            style,
-            0,
-            0,
-            200,
-            100,
-            parent,
-            null_mut(),
-            GetModuleHandleW(null()),
-            null(),
-        )
-    };
-    let parent = control("STATIC", HWND_MESSAGE, 0);
-    let edit = control("EDIT", parent, WS_CHILD);
-    let list = control("LISTBOX", parent, WS_CHILD);
-    assert!(!parent.is_null() && !edit.is_null() && !list.is_null());
-    let (index_tx, index_rx) = mpsc::channel();
-    let mut providers = ProviderRegistry::new();
-    providers.register(WebSearchProvider);
-    let state = RefCell::new(App {
-        edit,
-        list,
-        results: Vec::new(),
-        providers,
-        font: null_mut(),
-        shortcut_font: null_mut(),
-        background: null_mut(),
-        dpi: 96,
-        light_theme: true,
-        usage: HashMap::new(),
-        pinned: HashSet::new(),
-        settings: Settings::default(),
-        hotkey_registered: false,
-        ai_service: AiService::new(parent as usize, AI_READY),
-        ai_window: null_mut(),
-        ai_generation: 0,
-        indexing: true,
-        modal_depth: 0,
-        index_tx,
-        index_rx,
-    });
-    unsafe {
-        SetWindowLongPtrW(parent, GWLP_USERDATA, &state as *const AppCell as isize);
-        SetWindowTextW(edit, wide("ss sample").as_ptr());
-        refresh_results(parent, None);
-        assert_eq!(SendMessageW(list, LB_GETCOUNT, 0, 0), 3);
-        SendMessageW(list, LB_SETCURSEL, 1, 0);
-        state
-            .borrow()
-            .index_tx
-            .send(Ok(ApplicationProvider::empty()))
-            .unwrap();
-        wnd_proc(parent, INDEX_READY, 0, 0);
-        assert_eq!(selected_result_position(parent), Some(1));
-        assert!(handle_action_shortcut(parent, VK_RETURN, true, false));
-        state.borrow_mut().settings.result_limit = 1;
-        wnd_proc(parent, FILE_SEARCH_READY, 0, 0);
-        assert_eq!(selected_result_position(parent), Some(0));
-        state.borrow_mut().results[0].actions = vec![Action::SystemCommand {
-            command: SystemCommand::Lock,
-        }];
-        assert!(handle_action_shortcut(parent, VK_RETURN, true, false));
+    crate::platform::windows::run_on_ui_thread(|| {
+        use super::*;
+        let control = |class: &str, parent, style| unsafe {
+            CreateWindowExW(
+                0,
+                wide(class).as_ptr(),
+                null(),
+                style,
+                0,
+                0,
+                200,
+                100,
+                parent,
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            )
+        };
+        let parent = control("STATIC", HWND_MESSAGE, 0);
+        let edit = control("EDIT", parent, WS_CHILD);
+        let list = control("LISTBOX", parent, WS_CHILD);
+        assert!(!parent.is_null() && !edit.is_null() && !list.is_null());
+        let (index_tx, index_rx) = mpsc::channel();
+        let mut providers = ProviderRegistry::new();
+        providers.register(WebSearchProvider);
+        let state = RefCell::new(App {
+            edit,
+            list,
+            results: Vec::new(),
+            providers,
+            font: null_mut(),
+            shortcut_font: null_mut(),
+            background: null_mut(),
+            dpi: 96,
+            light_theme: true,
+            usage: HashMap::new(),
+            pinned: HashSet::new(),
+            settings: Settings::default(),
+            hotkey_registered: false,
+            ai_service: AiService::new(parent as usize, AI_READY),
+            ai_window: null_mut(),
+            ai_generation: 0,
+            indexing: true,
+            modal_depth: 0,
+            index_tx,
+            index_rx,
+        });
+        // Declared after `state` so GWLP_USERDATA is cleared and `parent` is destroyed before `state` drops.
+        let _parent_guard = TestWindowGuard(parent);
+        unsafe {
+            SetWindowLongPtrW(parent, GWLP_USERDATA, &state as *const AppCell as isize);
+            SetWindowTextW(edit, wide("ss sample").as_ptr());
+            refresh_results(parent, None);
+            assert_eq!(SendMessageW(list, LB_GETCOUNT, 0, 0), 3);
+            SendMessageW(list, LB_SETCURSEL, 1, 0);
+            state
+                .borrow()
+                .index_tx
+                .send(Ok(ApplicationProvider::empty()))
+                .unwrap();
+            wnd_proc(parent, INDEX_READY, 0, 0);
+            assert_eq!(selected_result_position(parent), Some(1));
+            assert!(handle_action_shortcut(parent, VK_RETURN, true, false));
+            state.borrow_mut().settings.result_limit = 1;
+            wnd_proc(parent, FILE_SEARCH_READY, 0, 0);
+            assert_eq!(selected_result_position(parent), Some(0));
+            state.borrow_mut().results[0].actions = vec![Action::SystemCommand {
+                command: SystemCommand::Lock,
+            }];
+            assert!(handle_action_shortcut(parent, VK_RETURN, true, false));
 
-        let answer =
-            show_ai_stream(parent, "新请求", AI_CANCEL, AI_WINDOW_CLOSED, 2, true).unwrap();
-        state.borrow_mut().ai_window = answer;
-        state.borrow_mut().ai_generation = 2;
-        wnd_proc(parent, AI_CANCEL, 1, answer as LPARAM);
-        wnd_proc(parent, AI_CANCEL, 2, edit as LPARAM);
-        assert!(append_ai_answer(answer, "新请求仍然有效"));
-        close_ai_answer(answer);
-        SetWindowLongPtrW(parent, GWLP_USERDATA, 0);
-        DestroyWindow(parent);
-    }
+            let answer =
+                show_ai_stream(parent, "新请求", AI_CANCEL, AI_WINDOW_CLOSED, 2, true).unwrap();
+            let _answer_guard = AiAnswerGuard(answer);
+            state.borrow_mut().ai_window = answer;
+            state.borrow_mut().ai_generation = 2;
+            wnd_proc(parent, AI_CANCEL, 1, answer as LPARAM);
+            wnd_proc(parent, AI_CANCEL, 2, edit as LPARAM);
+            assert!(append_ai_answer(answer, "新请求仍然有效"));
+        }
+    });
 }
 
 #[test]
 fn modal_dialogs_prevent_deactivate_from_hiding_the_launcher() {
-    use super::*;
-    let hwnd = unsafe {
-        CreateWindowExW(
-            WS_EX_TOOLWINDOW,
-            wide("STATIC").as_ptr(),
-            null(),
-            WS_POPUP | WS_VISIBLE,
-            0,
-            0,
-            100,
-            100,
-            null_mut(),
-            null_mut(),
-            GetModuleHandleW(null()),
-            null(),
-        )
-    };
-    assert!(!hwnd.is_null());
-    let (index_tx, index_rx) = mpsc::channel();
-    let state = RefCell::new(App {
-        edit: null_mut(),
-        list: null_mut(),
-        results: Vec::new(),
-        providers: ProviderRegistry::new(),
-        font: null_mut(),
-        shortcut_font: null_mut(),
-        background: null_mut(),
-        dpi: 96,
-        light_theme: true,
-        usage: HashMap::new(),
-        pinned: HashSet::new(),
-        settings: Settings::default(),
-        hotkey_registered: false,
-        ai_service: AiService::new(hwnd as usize, AI_READY),
-        ai_window: null_mut(),
-        ai_generation: 0,
-        indexing: false,
-        modal_depth: 0,
-        index_tx,
-        index_rx,
-    });
-    unsafe {
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, &state as *const AppCell as isize);
-        assert_ne!(IsWindowVisible(hwnd), 0);
-        {
-            let _modal = begin_modal(hwnd);
-            wnd_proc(hwnd, WM_ACTIVATE, WA_INACTIVE as WPARAM, 0);
+    crate::platform::windows::run_on_ui_thread(|| {
+        use super::*;
+        let hwnd = unsafe {
+            CreateWindowExW(
+                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+                wide("STATIC").as_ptr(),
+                null(),
+                WS_POPUP,
+                0,
+                0,
+                100,
+                100,
+                null_mut(),
+                null_mut(),
+                GetModuleHandleW(null()),
+                null(),
+            )
+        };
+        assert!(!hwnd.is_null());
+        unsafe { ShowWindow(hwnd, SW_SHOWNOACTIVATE) };
+        let (index_tx, index_rx) = mpsc::channel();
+        let state = RefCell::new(App {
+            edit: null_mut(),
+            list: null_mut(),
+            results: Vec::new(),
+            providers: ProviderRegistry::new(),
+            font: null_mut(),
+            shortcut_font: null_mut(),
+            background: null_mut(),
+            dpi: 96,
+            light_theme: true,
+            usage: HashMap::new(),
+            pinned: HashSet::new(),
+            settings: Settings::default(),
+            hotkey_registered: false,
+            ai_service: AiService::new(hwnd as usize, AI_READY),
+            ai_window: null_mut(),
+            ai_generation: 0,
+            indexing: false,
+            modal_depth: 0,
+            index_tx,
+            index_rx,
+        });
+        // Declared after `state` so GWLP_USERDATA is cleared and `hwnd` is destroyed before `state` drops.
+        let _hwnd_guard = TestWindowGuard(hwnd);
+        unsafe {
+            SetWindowLongPtrW(hwnd, GWLP_USERDATA, &state as *const AppCell as isize);
             assert_ne!(IsWindowVisible(hwnd), 0);
+            {
+                let _modal = begin_modal(hwnd);
+                wnd_proc(hwnd, WM_ACTIVATE, WA_INACTIVE as WPARAM, 0);
+                assert_ne!(IsWindowVisible(hwnd), 0);
+            }
+            wnd_proc(hwnd, WM_ACTIVATE, WA_INACTIVE as WPARAM, 0);
+            assert_eq!(IsWindowVisible(hwnd), 0);
         }
-        wnd_proc(hwnd, WM_ACTIVATE, WA_INACTIVE as WPARAM, 0);
-        assert_eq!(IsWindowVisible(hwnd), 0);
-        SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-        DestroyWindow(hwnd);
-    }
+    });
 }

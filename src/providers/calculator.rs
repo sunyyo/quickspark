@@ -1,4 +1,4 @@
-use crate::model::{Action, Query, ResultItem};
+use crate::model::{Action, Query};
 
 use super::{Provider, ProviderContext, ProviderOutput};
 
@@ -19,33 +19,28 @@ impl Provider for CalculatorProvider {
         };
         let expression = expression.trim();
         if expression.is_empty() {
-            return calculator_message("计算器：输入 = 表达式，例如 = (12+3)*4");
+            return ProviderOutput::exclusive_item(
+                PROVIDER_ID,
+                "计算器：输入 = 表达式，例如 = (12+3)*4",
+                200_000,
+                Vec::new(),
+            );
         }
         let Ok(value) = evaluate(expression) else {
-            return calculator_message("计算表达式无效，请检查数字、括号和运算符");
+            return ProviderOutput::exclusive_item(
+                PROVIDER_ID,
+                "计算表达式无效，请检查数字、括号和运算符",
+                200_000,
+                Vec::new(),
+            );
         };
         let result = format_number(value);
-        ProviderOutput {
-            results: vec![ResultItem {
-                provider_id: PROVIDER_ID,
-                title: format!("= {result}"),
-                score: 200_000,
-                actions: vec![Action::CopyText { text: result }],
-            }],
-            exclusive: true,
-        }
-    }
-}
-
-fn calculator_message(title: &str) -> ProviderOutput {
-    ProviderOutput {
-        results: vec![ResultItem {
-            provider_id: PROVIDER_ID,
-            title: title.to_owned(),
-            score: 200_000,
-            actions: Vec::new(),
-        }],
-        exclusive: true,
+        ProviderOutput::exclusive_item(
+            PROVIDER_ID,
+            format!("= {result}"),
+            200_000,
+            vec![Action::CopyText { text: result }],
+        )
     }
 }
 

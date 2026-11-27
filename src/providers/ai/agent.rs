@@ -41,9 +41,18 @@ const ANSWER_SAFETY_RULES: &str = r#"QuickSpark 联网回答规则：
 4. 最终回答不要输出来源编号、参考资料列表、URL 或搜索提示。"#;
 
 #[derive(Debug, PartialEq, Eq)]
-pub(super) enum AgentDecision {
+enum AgentDecision {
     Search(Vec<String>),
     Answer,
+}
+
+struct AgentRun<'a> {
+    config: &'a AiConfig,
+    api_key: &'a str,
+    service: &'a AiService,
+    context: transport::RequestContext,
+    started: Instant,
+    budget: Duration,
 }
 
 pub(super) fn run(
@@ -56,44 +65,41 @@ pub(super) fn run(
         return Err("请先输入 ai settings，配置完整 API 地址和模型名称".to_owned());
     }
     let ai_api_key = load_ai_api_key(&config.api_url)?.unwrap_or_default();
-    let context = transport::RequestContext {
-        current_generation: Arc::clone(&service.generation),
-        generation,
+    let run = AgentRun {
+        config,
+        api_key: &ai_api_key,
+        service,
+        context: transport::RequestContext {
+            current_generation: Arc::clone(&service.generation),
+            generation,
+        },
+        started: Instant::now(),
+        budget: agent_budget(config.timeout_seconds),
     };
-    let started = Instant::now();
     let use_research =
         request.task == AiTask::Question && request.web_search != WebSearchMode::Disabled;
-    let total_budget = agent_budget(config.timeout_seconds);
     let (mut sources, warning) = if use_research {
-        research(
-            request,
-            config,
-            &ai_api_key,
-            context.clone(),
-            generation,
-            service,
-            started,
-            total_budget,
-        )?
+        run.research(request)?
     } else {
         (Vec::new(), None)
     };
     sources = fit_sources(sources);
-    if use_research && !sources.is_empty() {
-        ensure_active(&context, started, total_budget)?;
+    let used_research = !sources.is_empty();
+    if used_research {
+        run.ensure_active()?;
     } else {
-        context.ensure_current()?;
+        run.context.ensure_current()?;
     }
 
     let mut final_request = request.clone();
     let mut final_config = config.clone();
     final_config.timeout_seconds = final_timeout_seconds(
         final_config.timeout_seconds,
-        use_research && !sources.is_empty(),
-        started,
-        total_budget,
+        used_research,
+        run.started.elapsed(),
+        run.budget,
     )?;
-    if !sources.is_empty() {
+    if used_research {
         final_request.request_prompt =
             grounded_prompt(&request.request_prompt, &sources, warning.as_deref());
         final_config.system_prompt = if config.system_prompt.trim().is_empty() {
@@ -102,167 +108,157 @@ pub(super) fn run(
             format!("{}\n\n{}", config.system_prompt.trim(), ANSWER_SAFETY_RULES)
         };
     }
-    service.emit_status(generation, "正在整理最终回答…");
+    run.emit_status("正在整理最终回答…");
     let body = transport::request_body(&final_config, &final_request);
-    let response =
-        transport::winhttp_stream_json(&final_config, &ai_api_key, &body, context, |delta| {
-            service.emit_delta(generation, delta)
-        })?;
-    Ok(response)
+    transport::winhttp_stream_json(&final_config, run.api_key, &body, &run.context, |delta| {
+        run.service.emit_delta(run.context.generation, delta)
+    })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn research(
-    request: &AiRequest,
-    config: &AiConfig,
-    ai_api_key: &str,
-    context: transport::RequestContext,
-    generation: u64,
-    service: &AiService,
-    started: Instant,
-    budget: Duration,
-) -> Result<(Vec<SearchSource>, Option<String>), String> {
-    let mut sources = Vec::new();
-    let mut source_urls = HashSet::new();
-    let mut executed_queries = Vec::new();
-    let mut executed_keys = HashSet::new();
-    let mut warning = None;
-    let mut pending = match request.web_search {
-        WebSearchMode::Required => vec![request.request_prompt.clone()],
-        WebSearchMode::Auto => {
-            service.emit_status(generation, "正在判断是否需要联网…");
-            match decide(
-                &request.request_prompt,
-                config,
-                ai_api_key,
-                &sources,
-                &executed_queries,
-                context.clone(),
-                started,
-                budget,
-            )? {
-                AgentDecision::Search(queries) => queries,
-                AgentDecision::Answer => return Ok((sources, warning)),
-            }
-        }
-        WebSearchMode::Disabled => return Ok((sources, warning)),
-    };
+impl AgentRun<'_> {
+    fn emit_status(&self, text: impl Into<String>) {
+        self.service.emit_status(self.context.generation, text);
+    }
 
-    let tavily_api_key = load_tavily_api_key()?.unwrap_or_default();
-    let mut round = 0usize;
-    while !pending.is_empty()
-        && round < MAX_SEARCH_ROUNDS
-        && executed_queries.len() < MAX_SEARCH_QUERIES
-        && sources.len() < MAX_SEARCH_SOURCES
-    {
-        ensure_active(&context, started, budget)?;
-        round += 1;
-        let remaining_queries = MAX_SEARCH_QUERIES.saturating_sub(executed_queries.len());
-        let mut searched_this_round = 0usize;
-        let mut last_error = None;
-        for query in pending.into_iter().take(remaining_queries) {
-            ensure_active(&context, started, budget)?;
-            let timeout_seconds = remaining_timeout_seconds(20, started, budget)?;
-            let query = normalize_query(&query);
-            if query.is_empty() || !executed_keys.insert(query.to_lowercase()) {
-                continue;
+    fn ensure_active(&self) -> Result<(), String> {
+        self.context.ensure_current()?;
+        if self.started.elapsed() > self.budget {
+            Err(format!(
+                "联网问答超过 {} 秒总时限；请缩小问题范围后重试",
+                self.budget.as_secs()
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn remaining_timeout_seconds(&self, configured: u32) -> Result<u32, String> {
+        remaining_timeout_seconds_after(configured, self.started.elapsed(), self.budget)
+    }
+
+    fn research(&self, request: &AiRequest) -> Result<(Vec<SearchSource>, Option<String>), String> {
+        let mut sources = Vec::new();
+        let mut source_urls = HashSet::new();
+        let mut executed_queries = Vec::new();
+        let mut executed_keys = HashSet::new();
+        let mut warning = None;
+        let mut pending = match request.web_search {
+            WebSearchMode::Required => vec![request.request_prompt.clone()],
+            WebSearchMode::Auto => {
+                self.emit_status("正在判断是否需要联网…");
+                match self.decide(&request.request_prompt, &sources, &executed_queries)? {
+                    AgentDecision::Search(queries) => queries,
+                    AgentDecision::Answer => return Ok((sources, warning)),
+                }
             }
-            executed_queries.push(query.clone());
-            searched_this_round += 1;
-            service.emit_status(
-                generation,
-                format!(
+            WebSearchMode::Disabled => return Ok((sources, warning)),
+        };
+
+        let tavily_api_key = load_tavily_api_key()?.unwrap_or_default();
+        let mut round = 0usize;
+        while !pending.is_empty()
+            && round < MAX_SEARCH_ROUNDS
+            && executed_queries.len() < MAX_SEARCH_QUERIES
+            && sources.len() < MAX_SEARCH_SOURCES
+        {
+            self.ensure_active()?;
+            round += 1;
+            let remaining_queries = MAX_SEARCH_QUERIES.saturating_sub(executed_queries.len());
+            let mut searched_this_round = 0usize;
+            let mut last_error = None;
+            for query in pending.into_iter().take(remaining_queries) {
+                self.ensure_active()?;
+                let timeout_seconds = self.remaining_timeout_seconds(20)?;
+                let query = super::preview(&query, 300);
+                if query.is_empty() || !executed_keys.insert(query.to_lowercase()) {
+                    continue;
+                }
+                executed_queries.push(query.clone());
+                searched_this_round += 1;
+                self.emit_status(format!(
                     "正在搜索第 {round}/{MAX_SEARCH_ROUNDS} 轮 · 查询 {}/{}：{}",
                     executed_queries.len(),
                     MAX_SEARCH_QUERIES,
                     super::preview(&query, 42)
-                ),
-            );
-            match tavily::search(&query, &tavily_api_key, timeout_seconds, context.clone()) {
-                Ok(results) => {
-                    for source in results {
-                        if sources.len() >= MAX_SEARCH_SOURCES {
-                            break;
-                        }
-                        let key = source.url.to_ascii_lowercase();
-                        if source_urls.insert(key) {
-                            sources.push(source);
+                ));
+                match tavily::search(&query, &tavily_api_key, timeout_seconds, &self.context) {
+                    Ok(results) => {
+                        for source in results {
+                            if sources.len() >= MAX_SEARCH_SOURCES {
+                                break;
+                            }
+                            let key = source.url.to_ascii_lowercase();
+                            if source_urls.insert(key) {
+                                sources.push(source);
+                            }
                         }
                     }
+                    Err(error) => last_error = Some(error),
                 }
-                Err(error) => last_error = Some(error),
             }
-        }
-        if searched_this_round == 0 {
-            break;
-        }
-        if sources.is_empty() {
-            return Err(last_error.unwrap_or_else(|| "Tavily 没有返回可用的搜索结果".to_owned()));
-        }
-        if let Some(error) = last_error {
-            warning = Some(format!("部分搜索失败：{error}"));
-        }
-        if round >= MAX_SEARCH_ROUNDS
-            || executed_queries.len() >= MAX_SEARCH_QUERIES
-            || sources.len() >= MAX_SEARCH_SOURCES
-        {
-            warning.get_or_insert_with(|| "已达到联网查证预算，基于现有来源整理回答".to_owned());
-            break;
-        }
+            if searched_this_round == 0 {
+                break;
+            }
+            if sources.is_empty() {
+                return Err(
+                    last_error.unwrap_or_else(|| "Tavily 没有返回可用的搜索结果".to_owned())
+                );
+            }
+            if let Some(error) = last_error {
+                warning = Some(format!("部分搜索失败：{error}"));
+            }
+            if round >= MAX_SEARCH_ROUNDS
+                || executed_queries.len() >= MAX_SEARCH_QUERIES
+                || sources.len() >= MAX_SEARCH_SOURCES
+            {
+                warning
+                    .get_or_insert_with(|| "已达到联网查证预算，基于现有来源整理回答".to_owned());
+                break;
+            }
 
-        service.emit_status(
-            generation,
-            format!("正在核查第 {round} 轮结果，判断是否需要继续搜索…"),
-        );
-        pending = match decide(
-            &request.request_prompt,
-            config,
-            ai_api_key,
-            &sources,
-            &executed_queries,
-            context.clone(),
-            started,
-            budget,
-        ) {
-            Ok(AgentDecision::Search(queries)) => queries,
-            Ok(AgentDecision::Answer) => Vec::new(),
-            Err(error) => {
-                warning = Some(format!("后续查证规划失败，已使用现有来源：{error}"));
-                Vec::new()
-            }
-        };
+            self.emit_status(format!("正在核查第 {round} 轮结果，判断是否需要继续搜索…"));
+            pending = match self.decide(&request.request_prompt, &sources, &executed_queries) {
+                Ok(AgentDecision::Search(queries)) => queries,
+                Ok(AgentDecision::Answer) => Vec::new(),
+                Err(error) => {
+                    warning = Some(format!("后续查证规划失败，已使用现有来源：{error}"));
+                    Vec::new()
+                }
+            };
+        }
+        Ok((sources, warning))
     }
-    Ok((sources, warning))
-}
 
-#[allow(clippy::too_many_arguments)]
-fn decide(
-    question: &str,
-    config: &AiConfig,
-    api_key: &str,
-    sources: &[SearchSource],
-    executed_queries: &[String],
-    context: transport::RequestContext,
-    started: Instant,
-    budget: Duration,
-) -> Result<AgentDecision, String> {
-    ensure_active(&context, started, budget)?;
-    let prompt = controller_input(question, sources, executed_queries);
-    let body = transport::agent_request_body(config, CONTROLLER_PROMPT, &prompt);
-    let mut planner_config = config.clone();
-    planner_config.timeout_seconds =
-        remaining_timeout_seconds(planner_config.timeout_seconds.min(30), started, budget)?;
-    let response = transport::winhttp_stream_json(&planner_config, api_key, &body, context, |_| {})
+    fn decide(
+        &self,
+        question: &str,
+        sources: &[SearchSource],
+        executed_queries: &[String],
+    ) -> Result<AgentDecision, String> {
+        self.ensure_active()?;
+        let prompt = controller_input(question, sources, executed_queries);
+        let body = transport::agent_request_body(self.config, CONTROLLER_PROMPT, &prompt);
+        let mut planner_config = self.config.clone();
+        planner_config.timeout_seconds =
+            self.remaining_timeout_seconds(planner_config.timeout_seconds.min(30))?;
+        let response = transport::winhttp_stream_json(
+            &planner_config,
+            self.api_key,
+            &body,
+            &self.context,
+            |_| {},
+        )
         .map_err(|error| format!("联网规划请求失败：{error}"))?;
-    if matches!(
-        response.completion,
-        crate::model::AiCompletion::Interrupted
-            | crate::model::AiCompletion::LengthLimit
-            | crate::model::AiCompletion::ContentFiltered
-    ) {
-        return Err(format!("联网规划未完成：{}", response.completion.status()));
+        if matches!(
+            response.completion,
+            crate::model::AiCompletion::Interrupted
+                | crate::model::AiCompletion::LengthLimit
+                | crate::model::AiCompletion::ContentFiltered
+        ) {
+            return Err(format!("联网规划未完成：{}", response.completion.status()));
+        }
+        parse_agent_decision(&response.answer)
     }
-    parse_agent_decision(&response.answer)
 }
 
 fn controller_input(
@@ -301,7 +297,7 @@ fn controller_input(
     )
 }
 
-pub(super) fn parse_agent_decision(text: &str) -> Result<AgentDecision, String> {
+fn parse_agent_decision(text: &str) -> Result<AgentDecision, String> {
     let text = text.trim();
     let parsed = serde_json::from_str::<Value>(text).or_else(|_| {
         let start = text.find('{').ok_or(())?;
@@ -322,7 +318,7 @@ pub(super) fn parse_agent_decision(text: &str) -> Result<AgentDecision, String> 
             let mut queries = Vec::new();
             if let Some(values) = value.get("queries").and_then(Value::as_array) {
                 for query in values.iter().filter_map(Value::as_str) {
-                    let query = normalize_query(query);
+                    let query = super::preview(query, 300);
                     if !query.is_empty() && seen.insert(query.to_lowercase()) {
                         queries.push(query);
                     }
@@ -334,7 +330,7 @@ pub(super) fn parse_agent_decision(text: &str) -> Result<AgentDecision, String> 
             if queries.is_empty()
                 && let Some(query) = value.get("query").and_then(Value::as_str)
             {
-                let query = normalize_query(query);
+                let query = super::preview(query, 300);
                 if !query.is_empty() {
                     queries.push(query);
                 }
@@ -349,16 +345,6 @@ pub(super) fn parse_agent_decision(text: &str) -> Result<AgentDecision, String> 
     }
 }
 
-fn normalize_query(value: &str) -> String {
-    let flattened = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut chars = flattened.chars();
-    let mut output = chars.by_ref().take(300).collect::<String>();
-    if chars.next().is_some() {
-        output.push('…');
-    }
-    output
-}
-
 fn agent_budget(configured_timeout_seconds: u32) -> Duration {
     MAX_AGENT_DURATION.max(Duration::from_secs(u64::from(configured_timeout_seconds)))
 }
@@ -366,38 +352,22 @@ fn agent_budget(configured_timeout_seconds: u32) -> Duration {
 fn final_timeout_seconds(
     configured: u32,
     used_web_research: bool,
-    started: Instant,
+    elapsed: Duration,
     budget: Duration,
 ) -> Result<u32, String> {
     if used_web_research {
-        remaining_timeout_seconds(configured, started, budget)
+        remaining_timeout_seconds_after(configured, elapsed, budget)
     } else {
         Ok(configured.max(5))
     }
 }
 
-fn ensure_active(
-    context: &transport::RequestContext,
-    started: Instant,
-    budget: Duration,
-) -> Result<(), String> {
-    context.ensure_current()?;
-    if started.elapsed() > budget {
-        Err(format!(
-            "联网问答超过 {} 秒总时限；请缩小问题范围后重试",
-            budget.as_secs()
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-fn remaining_timeout_seconds(
+fn remaining_timeout_seconds_after(
     configured: u32,
-    started: Instant,
+    elapsed: Duration,
     budget: Duration,
 ) -> Result<u32, String> {
-    let remaining = budget.saturating_sub(started.elapsed());
+    let remaining = budget.saturating_sub(elapsed);
     let remaining_seconds = remaining.as_secs();
     if remaining_seconds < 5 {
         return Err(format!(
@@ -460,7 +430,7 @@ fn grounded_prompt(question: &str, sources: &[SearchSource], warning: Option<&st
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, Instant};
+    use std::time::Duration;
 
     use super::{AgentDecision, agent_budget, final_timeout_seconds, parse_agent_decision};
 
@@ -486,13 +456,22 @@ mod tests {
 
     #[test]
     fn preserves_long_configured_timeouts_without_silent_120s_clamping() {
-        let started = Instant::now();
         assert_eq!(agent_budget(60), Duration::from_secs(120));
         assert_eq!(agent_budget(300), Duration::from_secs(300));
         assert_eq!(
-            final_timeout_seconds(300, false, started, agent_budget(300)).unwrap(),
+            final_timeout_seconds(300, false, Duration::ZERO, agent_budget(300)).unwrap(),
             300
         );
-        assert!(final_timeout_seconds(300, true, started, agent_budget(300)).unwrap() >= 299);
+        assert_eq!(
+            final_timeout_seconds(300, true, Duration::ZERO, agent_budget(300)).unwrap(),
+            300
+        );
+        assert_eq!(
+            final_timeout_seconds(300, true, Duration::from_secs(10), agent_budget(300)).unwrap(),
+            290
+        );
+        assert!(
+            final_timeout_seconds(300, true, Duration::from_secs(296), agent_budget(300)).is_err()
+        );
     }
 }

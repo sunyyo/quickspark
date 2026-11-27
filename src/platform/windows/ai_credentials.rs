@@ -1,4 +1,4 @@
-use std::{os::windows::ffi::OsStrExt, ptr::null};
+use std::ptr::null;
 
 use windows_sys::Win32::{
     Foundation::{ERROR_CANCELLED, ERROR_NOT_FOUND, GetLastError, HWND, NO_ERROR},
@@ -12,7 +12,7 @@ use windows_sys::Win32::{
     },
 };
 
-use super::{ParsedUrl, wide};
+use super::{ParsedUrl, copy_wide, wide};
 
 const LEGACY_AI_TARGET: &str = "QuickSpark/AI/APIKey";
 const TAVILY_TARGET: &str = "QuickSpark/Tavily/APIKey";
@@ -137,10 +137,10 @@ fn prompt_api_key(
     let caption = wide(caption_text);
     let target = wide(target_name);
     let mut username = vec![0u16; 64];
-    copy_wide_to_buffer("API Key", &mut username);
+    copy_wide("API Key", &mut username);
     let mut password = vec![0u16; 2_048];
     if let Some(existing) = existing {
-        copy_wide_to_buffer(existing, &mut password);
+        copy_wide(existing, &mut password);
     }
     let info = CREDUI_INFOW {
         cbSize: std::mem::size_of::<CREDUI_INFOW>() as u32,
@@ -231,17 +231,6 @@ fn save_api_key(target_name: &str, username_label: &str, api_key: &str) -> Resul
         return Err(last_error("无法保存 API Key"));
     }
     Ok(())
-}
-
-fn copy_wide_to_buffer(value: &str, buffer: &mut [u16]) {
-    if buffer.is_empty() {
-        return;
-    }
-    let encoded = std::ffi::OsStr::new(value).encode_wide();
-    let capacity = buffer.len() - 1;
-    for (destination, source) in buffer.iter_mut().take(capacity).zip(encoded) {
-        *destination = source;
-    }
 }
 
 fn last_error(context: &str) -> String {

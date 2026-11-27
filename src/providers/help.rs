@@ -1,6 +1,6 @@
 use crate::model::{Action, Query, ResultItem};
 
-use super::{Provider, ProviderContext, ProviderOutput};
+use super::{Provider, ProviderContext, ProviderOutput, matches_all_terms, strip_keyword_prefix};
 
 const PROVIDER_ID: &str = "help";
 
@@ -23,23 +23,17 @@ impl Provider for HelpProvider {
             .collect::<Vec<_>>();
 
         if results.is_empty() {
-            return ProviderOutput {
-                results: vec![ResultItem {
-                    provider_id: PROVIDER_ID,
-                    title: format!("没有找到“{terms}”的说明；输入 ? 查看全部功能"),
-                    score: 100_000,
-                    actions: vec![Action::SetQuery {
-                        query: "?".to_owned(),
-                    }],
+            return ProviderOutput::exclusive_item(
+                PROVIDER_ID,
+                format!("没有找到“{terms}”的说明；输入 ? 查看全部功能"),
+                100_000,
+                vec![Action::SetQuery {
+                    query: "?".to_owned(),
                 }],
-                exclusive: true,
-            };
+            );
         }
 
-        ProviderOutput {
-            results,
-            exclusive: true,
-        }
+        ProviderOutput::exclusive(results)
     }
 }
 
@@ -178,29 +172,11 @@ fn help_query(input: &str) -> Option<&str> {
     if let Some(terms) = input.strip_prefix('?').or_else(|| input.strip_prefix('？')) {
         return Some(terms.trim());
     }
-    if ["help", "manual", "帮助", "说明", "说明书"]
-        .iter()
-        .any(|prefix| input.eq_ignore_ascii_case(prefix))
-    {
-        return Some("");
-    }
-    let split_at = input.find(char::is_whitespace)?;
-    let (prefix, terms) = input.split_at(split_at);
-    ["help", "manual", "帮助", "说明", "说明书"]
-        .iter()
-        .any(|candidate| prefix.eq_ignore_ascii_case(candidate))
-        .then_some(terms.trim())
+    strip_keyword_prefix(input, &["help", "manual", "帮助", "说明", "说明书"])
 }
 
 fn topic_matches(topic: &HelpTopic, terms: &str) -> bool {
-    if terms.is_empty() {
-        return true;
-    }
-    let searchable = format!("{} {} {}", topic.title, topic.details, topic.keywords).to_lowercase();
-    terms
-        .to_lowercase()
-        .split_whitespace()
-        .all(|term| searchable.contains(term))
+    matches_all_terms(&[topic.title, topic.details, topic.keywords], terms)
 }
 
 fn topic_result(topic: &HelpTopic, position: usize) -> ResultItem {

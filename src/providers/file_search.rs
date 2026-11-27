@@ -4,7 +4,7 @@ use std::{
     path::PathBuf,
     ptr::{NonNull, null, null_mut},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicU64, Ordering},
         mpsc::{self, Receiver, RecvTimeoutError, Sender},
     },
@@ -28,7 +28,7 @@ use crate::{
     platform::windows::wide,
 };
 
-use super::{Provider, ProviderContext, ProviderOutput};
+use super::{Provider, ProviderContext, ProviderOutput, lock, strip_keyword_prefix};
 
 const PROVIDER_ID: &str = "file-search";
 const RESULT_LIMIT: usize = 20;
@@ -74,30 +74,32 @@ impl FileSearchProvider {
     }
 
     fn invalidate(&self) {
-        let mut state = lock_state(&self.state);
-        if state.requested.is_some() || state.completed.is_some() {
-            state.requested = None;
-            state.completed = None;
+        let mut state = lock(&self.state);
+        if !matches!(*state, ProviderState::Idle) {
+            *state = ProviderState::Idle;
             self.latest_generation.fetch_add(1, Ordering::AcqRel);
         }
     }
 
     fn request(&self, terms: &str) -> Option<SearchOutcome> {
-        let mut state = lock_state(&self.state);
-        if state.requested.as_deref() != Some(terms) {
-            let generation = self.latest_generation.fetch_add(1, Ordering::AcqRel) + 1;
-            state.requested = Some(terms.to_owned());
-            state.completed = None;
-            let _ = self.requests.send(SearchRequest {
-                generation,
-                terms: terms.to_owned(),
-            });
+        let mut state = lock(&self.state);
+        match &*state {
+            ProviderState::Completed {
+                terms: current,
+                outcome,
+            } if current == terms => return Some(outcome.clone()),
+            ProviderState::Pending { terms: current } if current == terms => return None,
+            _ => {}
         }
-        state
-            .completed
-            .as_ref()
-            .filter(|completed| completed.terms == terms)
-            .map(|completed| completed.outcome.clone())
+        let generation = self.latest_generation.fetch_add(1, Ordering::AcqRel) + 1;
+        *state = ProviderState::Pending {
+            terms: terms.to_owned(),
+        };
+        let _ = self.requests.send(SearchRequest {
+            generation,
+            terms: terms.to_owned(),
+        });
+        None
     }
 }
 
@@ -115,61 +117,66 @@ impl Provider for FileSearchProvider {
         let terms = terms.trim();
         if terms.is_empty() {
             self.invalidate();
-            return exclusive_message("输入 f 关键词通过 Everything 搜索文件");
+            return ProviderOutput::exclusive_item(
+                PROVIDER_ID,
+                "输入 f 关键词通过 Everything 搜索文件",
+                100_000,
+                Vec::new(),
+            );
         }
         if terms.chars().count() < 2 {
             self.invalidate();
-            return exclusive_message("请至少输入 2 个字符");
+            return ProviderOutput::exclusive_item(
+                PROVIDER_ID,
+                "请至少输入 2 个字符",
+                100_000,
+                Vec::new(),
+            );
         }
 
         match self.request(terms) {
-            None => exclusive_message("正在通过 Everything 搜索…"),
-            Some(SearchOutcome::Unavailable) => {
-                exclusive_message("Everything 不可用，请安装或启动 Everything")
-            }
+            None => ProviderOutput::exclusive_item(
+                PROVIDER_ID,
+                "正在通过 Everything 搜索…",
+                100_000,
+                Vec::new(),
+            ),
+            Some(SearchOutcome::Unavailable) => ProviderOutput::exclusive_item(
+                PROVIDER_ID,
+                "Everything 不可用，请安装或启动 Everything",
+                100_000,
+                Vec::new(),
+            ),
             Some(SearchOutcome::Entries(entries)) if entries.is_empty() => {
-                exclusive_message(&format!("Everything 未找到“{terms}”"))
+                ProviderOutput::exclusive_item(
+                    PROVIDER_ID,
+                    format!("Everything 未找到“{terms}”"),
+                    100_000,
+                    Vec::new(),
+                )
             }
-            Some(SearchOutcome::Entries(entries)) => ProviderOutput {
-                results: entries.into_iter().map(ResultItem::from).collect(),
-                exclusive: true,
-            },
+            Some(SearchOutcome::Entries(entries)) => {
+                ProviderOutput::exclusive(entries.into_iter().map(ResultItem::from).collect())
+            }
         }
-    }
-}
-
-fn exclusive_message(message: &str) -> ProviderOutput {
-    ProviderOutput {
-        results: vec![ResultItem {
-            provider_id: PROVIDER_ID,
-            title: message.to_owned(),
-            score: 100_000,
-            actions: Vec::new(),
-        }],
-        exclusive: true,
     }
 }
 
 fn file_query(input: &str) -> Option<&str> {
-    let input = input.trim();
-    if input.eq_ignore_ascii_case("f") || input.eq_ignore_ascii_case("file") {
-        return Some("");
-    }
-    let split_at = input.find(char::is_whitespace)?;
-    let (prefix, terms) = input.split_at(split_at);
-    (prefix.eq_ignore_ascii_case("f") || prefix.eq_ignore_ascii_case("file"))
-        .then_some(terms.trim())
+    strip_keyword_prefix(input, &["f", "file"])
 }
 
 #[derive(Default)]
-struct ProviderState {
-    requested: Option<String>,
-    completed: Option<CompletedSearch>,
-}
-
-struct CompletedSearch {
-    terms: String,
-    outcome: SearchOutcome,
+enum ProviderState {
+    #[default]
+    Idle,
+    Pending {
+        terms: String,
+    },
+    Completed {
+        terms: String,
+        outcome: SearchOutcome,
+    },
 }
 
 #[derive(Clone)]
@@ -252,25 +259,20 @@ fn search_worker(
         if latest_generation.load(Ordering::Acquire) != request.generation {
             continue;
         }
-        let mut provider_state = lock_state(&state);
-        if provider_state.requested.as_deref() != Some(request.terms.as_str()) {
+        let mut provider_state = lock(&state);
+        if !matches!(&*provider_state, ProviderState::Pending { terms } if *terms == request.terms)
+        {
             continue;
         }
-        provider_state.completed = Some(CompletedSearch {
+        *provider_state = ProviderState::Completed {
             terms: request.terms,
             outcome,
-        });
+        };
         drop(provider_state);
         unsafe {
             PostMessageW(window as _, ready_message, 0, 0);
         }
     }
-}
-
-fn lock_state(state: &Mutex<ProviderState>) -> std::sync::MutexGuard<'_, ProviderState> {
-    state
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -297,18 +299,21 @@ struct EverythingClient {
 
 impl EverythingClient {
     fn new() -> Option<Self> {
+        static CLASS_REGISTERED: OnceLock<()> = OnceLock::new();
         let reply = Box::into_raw(Box::new(RefCell::new(ReplyContext::default())));
         let class_name = wide(REPLY_WINDOW_CLASS);
         let instance = unsafe { GetModuleHandleW(null()) };
-        let window_class = WNDCLASSW {
-            lpfnWndProc: Some(everything_reply_window_proc),
-            hInstance: instance,
-            lpszClassName: class_name.as_ptr(),
-            ..unsafe { std::mem::zeroed() }
-        };
-        unsafe {
-            RegisterClassW(&window_class);
-        }
+        CLASS_REGISTERED.get_or_init(|| {
+            let window_class = WNDCLASSW {
+                lpfnWndProc: Some(everything_reply_window_proc),
+                hInstance: instance,
+                lpszClassName: class_name.as_ptr(),
+                ..unsafe { std::mem::zeroed() }
+            };
+            unsafe {
+                RegisterClassW(&window_class);
+            }
+        });
         let hwnd = unsafe {
             CreateWindowExW(
                 0,
@@ -471,7 +476,7 @@ unsafe extern "system" fn everything_reply_window_proc(
 }
 
 fn build_everything_query(reply_hwnd: u32, reply_token: u32, terms: &str, limit: u32) -> Vec<u8> {
-    let search: Vec<u16> = terms.encode_utf16().chain(Some(0)).collect();
+    let search = wide(terms);
     let mut query = Vec::with_capacity(QUERY2_HEADER_SIZE + search.len() * size_of::<u16>());
     for value in [
         reply_hwnd,
@@ -642,63 +647,65 @@ mod tests {
 
     #[test]
     fn native_reply_window_receives_matching_copydata_and_ignores_stale_tokens() {
-        use windows_sys::Win32::{
-            Foundation::LPARAM,
-            System::DataExchange::COPYDATASTRUCT,
-            UI::WindowsAndMessaging::{SendMessageW, WM_COPYDATA},
-        };
+        crate::platform::windows::run_on_ui_thread(|| {
+            use windows_sys::Win32::{
+                Foundation::LPARAM,
+                System::DataExchange::COPYDATASTRUCT,
+                UI::WindowsAndMessaging::{SendMessageW, WM_COPYDATA},
+            };
 
-        let client = EverythingClient::new().expect("reply window should be created");
-        client
-            .with_reply(|reply| {
-                reply.expected_token = 0x5153_0007;
-                reply.outcome = None;
-            })
-            .unwrap();
+            let client = EverythingClient::new().expect("reply window should be created");
+            client
+                .with_reply(|reply| {
+                    reply.expected_token = 0x5153_0007;
+                    reply.outcome = None;
+                })
+                .unwrap();
 
-        let mut payload = reply_with_paths(&[r"C:\Docs\说明.txt"]);
-        let stale = COPYDATASTRUCT {
-            dwData: 0x5153_0006,
-            cbData: payload.len() as u32,
-            lpData: payload.as_mut_ptr().cast(),
-        };
-        assert_eq!(
-            unsafe {
-                SendMessageW(
-                    client.hwnd,
-                    WM_COPYDATA,
-                    0,
-                    &stale as *const COPYDATASTRUCT as LPARAM,
-                )
-            },
-            0
-        );
-        assert!(client.with_reply(|reply| reply.outcome.is_none()).unwrap());
+            let mut payload = reply_with_paths(&[r"C:\Docs\说明.txt"]);
+            let stale = COPYDATASTRUCT {
+                dwData: 0x5153_0006,
+                cbData: payload.len() as u32,
+                lpData: payload.as_mut_ptr().cast(),
+            };
+            assert_eq!(
+                unsafe {
+                    SendMessageW(
+                        client.hwnd,
+                        WM_COPYDATA,
+                        0,
+                        &stale as *const COPYDATASTRUCT as LPARAM,
+                    )
+                },
+                0
+            );
+            assert!(client.with_reply(|reply| reply.outcome.is_none()).unwrap());
 
-        let matching = COPYDATASTRUCT {
-            dwData: 0x5153_0007,
-            cbData: payload.len() as u32,
-            lpData: payload.as_mut_ptr().cast(),
-        };
-        assert_eq!(
-            unsafe {
-                SendMessageW(
-                    client.hwnd,
-                    WM_COPYDATA,
-                    0,
-                    &matching as *const COPYDATASTRUCT as LPARAM,
-                )
-            },
-            1
-        );
-        let outcome = client.with_reply(|reply| reply.outcome.take()).unwrap();
-        assert_eq!(
-            outcome,
-            Some(Ok(vec![FileEntry {
-                name: "说明.txt".to_owned(),
-                path: PathBuf::from(r"C:\Docs\说明.txt"),
-            }]))
-        );
+            let matching = COPYDATASTRUCT {
+                dwData: 0x5153_0007,
+                cbData: payload.len() as u32,
+                lpData: payload.as_mut_ptr().cast(),
+            };
+            assert_eq!(
+                unsafe {
+                    SendMessageW(
+                        client.hwnd,
+                        WM_COPYDATA,
+                        0,
+                        &matching as *const COPYDATASTRUCT as LPARAM,
+                    )
+                },
+                1
+            );
+            let outcome = client.with_reply(|reply| reply.outcome.take()).unwrap();
+            assert_eq!(
+                outcome,
+                Some(Ok(vec![FileEntry {
+                    name: "说明.txt".to_owned(),
+                    path: PathBuf::from(r"C:\Docs\说明.txt"),
+                }]))
+            );
+        });
     }
 
     #[test]

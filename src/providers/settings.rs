@@ -1,9 +1,12 @@
 use crate::{
     model::{Action, Query, ResultItem, SettingChange},
-    storage::commands_file,
+    storage::commands_path,
 };
 
-use super::{Provider, ProviderContext, ProviderOutput, file_search::everything_available};
+use super::{
+    Provider, ProviderContext, ProviderOutput, file_search::everything_available,
+    matches_all_terms, strip_keyword_prefix,
+};
 
 const PROVIDER_ID: &str = "settings";
 
@@ -74,7 +77,7 @@ impl Provider for SettingsProvider {
                 }),
             },
         ];
-        if let Some(path) = commands_file() {
+        if let Some(path) = commands_path() {
             entries.push(SettingEntry {
                 title: "自定义指令：打开 commands.txt 编辑".to_owned(),
                 keywords: "自定义 指令 命令 commands edit 配置",
@@ -105,22 +108,17 @@ impl Provider for SettingsProvider {
                 actions: entry.action.into_iter().collect(),
             })
             .collect::<Vec<_>>();
-        let results = if results.is_empty() {
-            vec![ResultItem {
-                provider_id: PROVIDER_ID,
-                title: format!("没有找到“{terms}”相关设置"),
-                score: 100_000,
-                actions: vec![Action::SetQuery {
+        if results.is_empty() {
+            return ProviderOutput::exclusive_item(
+                PROVIDER_ID,
+                format!("没有找到“{terms}”相关设置"),
+                100_000,
+                vec![Action::SetQuery {
                     query: "settings".to_owned(),
                 }],
-            }]
-        } else {
-            results
-        };
-        ProviderOutput {
-            results,
-            exclusive: true,
+            );
         }
+        ProviderOutput::exclusive(results)
     }
 }
 
@@ -132,14 +130,7 @@ struct SettingEntry {
 
 impl SettingEntry {
     fn matches(&self, terms: &str) -> bool {
-        if terms.is_empty() {
-            return true;
-        }
-        let searchable = format!("{} {}", self.title, self.keywords).to_lowercase();
-        terms
-            .to_lowercase()
-            .split_whitespace()
-            .all(|term| searchable.contains(term))
+        matches_all_terms(&[&self.title, self.keywords], terms)
     }
 }
 
@@ -152,19 +143,7 @@ fn setting_result(title: String, keywords: &'static str, change: SettingChange) 
 }
 
 fn settings_query(input: &str) -> Option<&str> {
-    let input = input.trim();
-    if ["settings", "setting", "set", "设置"]
-        .iter()
-        .any(|prefix| input.eq_ignore_ascii_case(prefix))
-    {
-        return Some("");
-    }
-    let split_at = input.find(char::is_whitespace)?;
-    let (prefix, terms) = input.split_at(split_at);
-    ["settings", "setting", "set", "设置"]
-        .iter()
-        .any(|candidate| prefix.eq_ignore_ascii_case(candidate))
-        .then_some(terms.trim())
+    strip_keyword_prefix(input, &["settings", "setting", "set", "设置"])
 }
 
 #[cfg(test)]

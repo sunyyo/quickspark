@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use crate::model::{Action, Query, ResultItem};
+use crate::model::{Action, Query};
 
 use super::{Provider, ProviderContext, ProviderOutput};
 
@@ -20,20 +20,17 @@ impl Provider for DriveProvider {
 
         // A bare "D:" is drive-relative on Windows; always open the root.
         let root = format!("{}:\\", input[0].to_ascii_uppercase() as char);
-        ProviderOutput {
-            results: vec![ResultItem {
-                provider_id: self.id(),
-                title: format!("打开磁盘：{root}"),
-                score: 100_000,
-                actions: vec![
-                    Action::OpenPath {
-                        path: PathBuf::from(&root),
-                    },
-                    Action::CopyText { text: root },
-                ],
-            }],
-            exclusive: true,
-        }
+        ProviderOutput::exclusive_item(
+            self.id(),
+            format!("打开磁盘：{root}"),
+            100_000,
+            vec![
+                Action::OpenPath {
+                    path: PathBuf::from(&root),
+                },
+                Action::CopyText { text: root },
+            ],
+        )
     }
 }
 

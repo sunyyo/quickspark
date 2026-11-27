@@ -131,6 +131,8 @@ pub(crate) struct AiConfig {
 
 const DEFAULT_SYSTEM_PROMPT: &str = "你是一名严谨、实用的中文 AI 助手。直接回答用户的核心问题，默认使用简体中文。简单问题简洁作答；复杂问题使用清晰的结构、步骤和必要示例。不得编造事实、来源或执行结果；不确定时明确说明，并给出验证方法。提供建议时应具体、可执行，并指出重要前提与风险。避免重复问题、空泛开场和不必要的总结。严格遵循用户指定的格式、语言和篇幅。";
 const LEGACY_SYSTEM_PROMPT: &str = "你是一个简洁、可靠的中文助手。";
+const THINKING_SETTINGS_COMMENT: &str =
+    "# DeepSeek V4 思考模式：auto / enabled / disabled；强度：high / max\n";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum ThinkingMode {
@@ -539,38 +541,59 @@ impl Drop for RegistryKey {
     }
 }
 
+pub(crate) fn commands_path() -> Option<PathBuf> {
+    data_file("commands.txt")
+}
+
+pub(crate) fn ensure_commands_file_if_target(path: &Path) {
+    if commands_path().as_deref() == Some(path) {
+        let _ = ensure_commands_file(path);
+    }
+}
+
 pub(crate) fn commands_file() -> Option<PathBuf> {
-    let path = data_file("commands.txt")?;
-    if !path.exists() {
-        let template = "# QuickSpark 自定义指令：别名 | 标题 | 目标\n\
+    let path = commands_path()?;
+    ensure_commands_file(&path).then_some(path)
+}
+
+fn ensure_commands_file(path: &Path) -> bool {
+    if path.exists() {
+        return true;
+    }
+    let template = "# QuickSpark 自定义指令：别名 | 标题 | 目标\n\
 # 使用 ; 查看指令，例如：; gh rust\n\
 # docs | 打开文档目录 | %USERPROFILE%\\Documents\n\
 # gh | 搜索 GitHub | https://github.com/search?q={query}\n";
-        if !write_atomic(&path, template) {
-            return None;
-        }
-    }
-    Some(path)
+    write_atomic(path, template)
 }
 
 pub(crate) fn ai_config_file() -> Option<PathBuf> {
     let path = data_file("ai-settings.txt")?;
     if !path.exists() {
-        let template = "# QuickSpark AI：OpenAI 兼容 Chat Completions 接口\n\
+        let defaults = AiConfig::default();
+        let template = format!(
+            "# QuickSpark AI：OpenAI 兼容 Chat Completions 接口\n\
 # API Key 请在 QuickSpark 中输入 ai key 安全设置，不要写在本文件。\n\
 api_url=\n\
 model=\n\
-system_prompt=你是一名严谨、实用的中文 AI 助手。直接回答用户的核心问题，默认使用简体中文。简单问题简洁作答；复杂问题使用清晰的结构、步骤和必要示例。不得编造事实、来源或执行结果；不确定时明确说明，并给出验证方法。提供建议时应具体、可执行，并指出重要前提与风险。避免重复问题、空泛开场和不必要的总结。严格遵循用户指定的格式、语言和篇幅。\n\
-max_tokens=8192\n\
-timeout_seconds=60\n\
-# DeepSeek V4 思考模式：auto / enabled / disabled；强度：high / max\n\
-thinking_mode=auto\n\
-reasoning_effort=high\n";
-        if !write_atomic(&path, template) {
+system_prompt={}\n\
+max_tokens={}\n\
+timeout_seconds={}\n\
+{THINKING_SETTINGS_COMMENT}\
+thinking_mode={}\n\
+reasoning_effort={}\n",
+            defaults.system_prompt,
+            defaults.max_tokens,
+            defaults.timeout_seconds,
+            defaults.thinking_mode.key(),
+            defaults.reasoning_effort.key(),
+        );
+        if !write_atomic(&path, &template) {
             return None;
         }
+    } else {
+        ensure_ai_thinking_settings(&path);
     }
-    ensure_ai_thinking_settings(&path);
     Some(path)
 }
 
@@ -595,17 +618,21 @@ fn ensure_ai_thinking_settings(path: &Path) {
         }
         text.push_str(line);
     }
+    let defaults = AiConfig::default();
     if !has_thinking_mode || !has_reasoning_effort {
         if !text.ends_with('\n') {
             text.push('\n');
         }
-        text.push_str("# DeepSeek V4 思考模式：auto / enabled / disabled；强度：high / max\n");
+        text.push_str(THINKING_SETTINGS_COMMENT);
     }
     if !has_thinking_mode {
-        text.push_str("thinking_mode=auto\n");
+        text.push_str(&format!("thinking_mode={}\n", defaults.thinking_mode.key()));
     }
     if !has_reasoning_effort {
-        text.push_str("reasoning_effort=high\n");
+        text.push_str(&format!(
+            "reasoning_effort={}\n",
+            defaults.reasoning_effort.key()
+        ));
     }
     if text != original {
         let _ = write_atomic(path, &text);
@@ -690,19 +717,43 @@ pub(crate) fn save_pinned(pinned: &HashSet<String>) -> bool {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::{
-        fs,
-        time::{SystemTime, UNIX_EPOCH},
-    };
+pub(crate) struct TestTempDir(PathBuf);
 
-    use super::{AiConfig, LEGACY_MIGRATION_MARKER, migrate_legacy_data_dirs};
+#[cfg(test)]
+impl TestTempDir {
+    pub(crate) fn new(prefix: &str) -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let path = env::temp_dir().join(format!("{prefix}-{}-{id}", std::process::id()));
+        let _ = fs::remove_dir_all(&path);
+        fs::create_dir_all(&path).expect("create test temp dir");
+        Self(path)
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[cfg(test)]
+impl Drop for TestTempDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::{AiConfig, LEGACY_MIGRATION_MARKER, TestTempDir, migrate_legacy_data_dirs};
 
     #[test]
     fn migration_only_replaces_the_complete_active_default_prompt() {
         use super::{DEFAULT_SYSTEM_PROMPT, LEGACY_SYSTEM_PROMPT, ensure_ai_thinking_settings};
-        let path =
-            std::env::temp_dir().join(format!("quickspark-prompt-{}.txt", std::process::id()));
+        let dir = TestTempDir::new("quickspark-prompt");
+        let path = dir.path().join("ai-settings.txt");
         let customized = format!(
             "# system_prompt={LEGACY_SYSTEM_PROMPT}\r\nother=system_prompt={LEGACY_SYSTEM_PROMPT}\r\nsystem_prompt={LEGACY_SYSTEM_PROMPT}只用法语。\r\n"
         );
@@ -718,7 +769,6 @@ mod tests {
         ensure_ai_thinking_settings(&path);
         ensure_ai_thinking_settings(&path);
         assert_eq!(fs::read_to_string(&path).unwrap(), expected);
-        fs::remove_file(path).unwrap();
     }
 
     #[test]
@@ -741,14 +791,8 @@ mod tests {
 
     #[test]
     fn legacy_migration_preserves_new_files_and_retries_partial_failures() {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        let root = std::env::temp_dir().join(format!(
-            "quickspark-migration-test-{}-{unique}",
-            std::process::id()
-        ));
+        let dir = TestTempDir::new("quickspark-migration-test");
+        let root = dir.path();
         let old = root.join("QuickLauncher");
         let new = root.join("QuickSpark");
         fs::create_dir_all(&old).unwrap();
@@ -770,13 +814,12 @@ mod tests {
         );
         assert_eq!(fs::read_to_string(new.join("theme.txt")).unwrap(), "dark");
         assert!(new.join(LEGACY_MIGRATION_MARKER).is_file());
-
-        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
     fn loads_ai_config_with_utf8_bom_on_first_line() {
-        let path = std::env::temp_dir().join(format!("quickspark-bom-{}.txt", std::process::id()));
+        let dir = TestTempDir::new("quickspark-bom");
+        let path = dir.path().join("ai-settings.txt");
         fs::write(
             &path,
             "\u{feff}api_url=https://example.com/v1/chat/completions\r\nmodel=demo-model\r\n",
@@ -785,6 +828,5 @@ mod tests {
         let config = super::load_ai_config_from(&path);
         assert_eq!(config.api_url, "https://example.com/v1/chat/completions");
         assert_eq!(config.model, "demo-model");
-        fs::remove_file(path).unwrap();
     }
 }

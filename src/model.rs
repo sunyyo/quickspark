@@ -52,10 +52,19 @@ impl AiCompletion {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum AiTask {
     Question,
     Translation,
+}
+
+impl AiTask {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Question => "AI 回答",
+            Self::Translation => "AI 翻译",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,10 +78,8 @@ pub(crate) enum WebSearchMode {
 pub(crate) struct AiRequest {
     pub(crate) display_prompt: String,
     pub(crate) request_prompt: String,
-    pub(crate) result_label: String,
     pub(crate) task: AiTask,
     pub(crate) web_search: WebSearchMode,
-    pub(crate) cache_key: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

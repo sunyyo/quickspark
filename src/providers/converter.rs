@@ -1,9 +1,12 @@
 use crate::{
-    model::{Action, Query, ResultItem},
+    model::{Action, Query},
     platform::windows::local_date,
 };
 
-use super::{Provider, ProviderContext, ProviderOutput, calculator::format_number};
+use super::{
+    Provider, ProviderContext, ProviderOutput, calculator::format_number, split_first_term,
+    strip_prefix_ascii_case,
+};
 
 const PROVIDER_ID: &str = "converter";
 
@@ -15,47 +18,36 @@ impl Provider for ConverterProvider {
     }
 
     fn query(&self, query: &Query, _context: &ProviderContext<'_>) -> ProviderOutput {
-        let converted = parse_unit_query(query.raw())
-            .or_else(|| parse_date_query(query.raw()))
-            .or_else(|| parse_base_query(query.raw()));
-        let Some(converted) = converted else {
-            if is_converter_query(query.raw()) {
-                return ProviderOutput {
-                    results: vec![ResultItem {
-                        provider_id: PROVIDER_ID,
-                        title: "换算格式无效；示例：%% 10 km to mi、date 2026-07-23 + 1d、hex 255"
-                            .to_owned(),
-                        score: 200_000,
-                        actions: Vec::new(),
-                    }],
-                    exclusive: true,
-                };
-            }
-            return ProviderOutput::empty();
+        let raw = query.raw().trim();
+        let (head, _) = split_first_term(raw);
+        let outcome = if raw.starts_with("%%") {
+            Some(parse_unit_query(raw))
+        } else if head.eq_ignore_ascii_case("date") {
+            Some(parse_date_query(raw))
+        } else if ["hex", "bin", "oct", "dec"]
+            .iter()
+            .any(|prefix| head.eq_ignore_ascii_case(prefix))
+        {
+            Some(parse_base_query(raw))
+        } else {
+            None
         };
-        ProviderOutput {
-            results: vec![ResultItem {
-                provider_id: PROVIDER_ID,
-                title: format!("= {converted}"),
-                score: 200_000,
-                actions: vec![Action::CopyText {
-                    text: converted.clone(),
-                }],
-            }],
-            exclusive: true,
+        match outcome {
+            None => ProviderOutput::empty(),
+            Some(None) => ProviderOutput::exclusive_item(
+                PROVIDER_ID,
+                "换算格式无效；示例：%% 10 km to mi、date 2026-07-23 + 1d、hex 255",
+                200_000,
+                Vec::new(),
+            ),
+            Some(Some(converted)) => ProviderOutput::exclusive_item(
+                PROVIDER_ID,
+                format!("= {converted}"),
+                200_000,
+                vec![Action::CopyText { text: converted }],
+            ),
         }
     }
-}
-
-fn is_converter_query(input: &str) -> bool {
-    let input = input.trim();
-    input.starts_with("%%")
-        || input.eq_ignore_ascii_case("date")
-        || input.split_whitespace().next().is_some_and(|prefix| {
-            ["date", "hex", "bin", "oct", "dec"]
-                .iter()
-                .any(|candidate| prefix.eq_ignore_ascii_case(candidate))
-        })
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -67,15 +59,20 @@ enum Dimension {
     Data,
 }
 
+#[derive(Clone, Copy)]
+enum TempScale {
+    Celsius,
+    Fahrenheit,
+    Kelvin,
+}
+
 enum Unit {
     Linear {
         dimension: Dimension,
         factor: f64,
         label: &'static str,
     },
-    Celsius,
-    Fahrenheit,
-    Kelvin,
+    Temperature(TempScale),
 }
 
 fn unit(name: &str) -> Option<Unit> {
@@ -109,9 +106,9 @@ fn unit(name: &str) -> Option<Unit> {
         "kib" => linear(Dimension::Data, 1_024.0, "KiB"),
         "mib" => linear(Dimension::Data, 1_048_576.0, "MiB"),
         "gib" => linear(Dimension::Data, 1_073_741_824.0, "GiB"),
-        "c" | "℃" | "celsius" => Some(Unit::Celsius),
-        "f" | "℉" | "fahrenheit" => Some(Unit::Fahrenheit),
-        "k" | "kelvin" => Some(Unit::Kelvin),
+        "c" | "℃" | "celsius" => Some(Unit::Temperature(TempScale::Celsius)),
+        "f" | "℉" | "fahrenheit" => Some(Unit::Temperature(TempScale::Fahrenheit)),
+        "k" | "kelvin" => Some(Unit::Temperature(TempScale::Kelvin)),
         _ => None,
     }
 }
@@ -157,27 +154,21 @@ fn convert(value: f64, source: Unit, destination: Unit) -> Option<(f64, &'static
                 label,
             },
         ) if left == right => Some((value * source_factor / destination_factor, label)),
-        (source, destination) if is_temperature(&source) && is_temperature(&destination) => {
+        (Unit::Temperature(source), Unit::Temperature(destination)) => {
             let celsius = match source {
-                Unit::Celsius => value,
-                Unit::Fahrenheit => (value - 32.0) * 5.0 / 9.0,
-                Unit::Kelvin => value - 273.15,
-                Unit::Linear { .. } => unreachable!(),
+                TempScale::Celsius => value,
+                TempScale::Fahrenheit => (value - 32.0) * 5.0 / 9.0,
+                TempScale::Kelvin => value - 273.15,
             };
             let (converted, label) = match destination {
-                Unit::Celsius => (celsius, "℃"),
-                Unit::Fahrenheit => (celsius * 9.0 / 5.0 + 32.0, "℉"),
-                Unit::Kelvin => (celsius + 273.15, "K"),
-                Unit::Linear { .. } => unreachable!(),
+                TempScale::Celsius => (celsius, "℃"),
+                TempScale::Fahrenheit => (celsius * 9.0 / 5.0 + 32.0, "℉"),
+                TempScale::Kelvin => (celsius + 273.15, "K"),
             };
             Some((converted, label))
         }
         _ => None,
     }
-}
-
-fn is_temperature(unit: &Unit) -> bool {
-    matches!(unit, Unit::Celsius | Unit::Fahrenheit | Unit::Kelvin)
 }
 
 fn parse_date_query(input: &str) -> Option<String> {
@@ -202,22 +193,24 @@ fn parse_date_query(input: &str) -> Option<String> {
             } else {
                 return None;
             };
-            let days = parse_day_delta(amount)?;
-            let signed_days = if positive { days } else { days.checked_neg()? };
-            add_days(date, signed_days)?
+            apply_date_delta(date, positive, amount)?
         }
         [operator, amount] if matches!(*operator, "+" | "-") => {
-            let days = parse_day_delta(amount)?;
-            let signed_days = if *operator == "+" {
-                days
-            } else {
-                days.checked_neg()?
-            };
-            add_days(date, signed_days)?
+            apply_date_delta(date, *operator == "+", amount)?
         }
         _ => return None,
     };
     Some(format_date(result))
+}
+
+fn apply_date_delta(
+    date: (i32, u32, u32),
+    positive: bool,
+    amount: &str,
+) -> Option<(i32, u32, u32)> {
+    let days = parse_day_delta(amount)?;
+    let signed_days = if positive { days } else { days.checked_neg()? };
+    add_days(date, signed_days)
 }
 
 fn parse_day_delta(value: &str) -> Option<i64> {
@@ -329,20 +322,11 @@ fn parse_integer(value: &str, default_radix: u32) -> Option<(bool, u128)> {
     if unsigned.is_empty() {
         return None;
     }
-    let (radix, digits) = if let Some(digits) = unsigned
-        .strip_prefix("0x")
-        .or_else(|| unsigned.strip_prefix("0X"))
-    {
+    let (radix, digits) = if let Some(digits) = strip_prefix_ascii_case(unsigned, "0x") {
         (16, digits)
-    } else if let Some(digits) = unsigned
-        .strip_prefix("0b")
-        .or_else(|| unsigned.strip_prefix("0B"))
-    {
+    } else if let Some(digits) = strip_prefix_ascii_case(unsigned, "0b") {
         (2, digits)
-    } else if let Some(digits) = unsigned
-        .strip_prefix("0o")
-        .or_else(|| unsigned.strip_prefix("0O"))
-    {
+    } else if let Some(digits) = strip_prefix_ascii_case(unsigned, "0o") {
         (8, digits)
     } else {
         (default_radix, unsigned)

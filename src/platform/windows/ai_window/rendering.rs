@@ -8,56 +8,37 @@ pub(super) fn rich_edit_available() -> bool {
 pub(super) unsafe fn render_answer(state: &AnswerWindow, scroll_to_end: bool) {
     let display = answer_display(&state.answer);
     let rendered = render_markdown(&display);
-    let end = rendered.text.encode_utf16().count();
     unsafe {
-        SendMessageW(state.answer_edit, WM_SETREDRAW, 0, 0);
-        SetWindowTextW(state.answer_edit, wide(&rendered.text).as_ptr());
-        if state.rich_edit {
-            SendMessageW(
-                state.answer_edit,
-                EM_SETBKGNDCOLOR,
-                0,
-                state.colors.answer_bg as LPARAM,
-            );
-            apply_base_format(state.answer_edit, end, state.colors.text);
-        }
-    }
-    if state.rich_edit {
-        for span in &rendered.spans {
-            unsafe { apply_markdown_span(state.answer_edit, span, state.colors) };
-        }
-    }
-    let caret = if scroll_to_end { end } else { 0 };
-    unsafe {
-        SendMessageW(state.answer_edit, EM_SETSEL, caret, caret as LPARAM);
-        SendMessageW(state.answer_edit, EM_SCROLLCARET, 0, 0);
-        SendMessageW(state.answer_edit, WM_SETREDRAW, 1, 0);
-        InvalidateRect(state.answer_edit, null(), 0);
-        UpdateWindow(state.answer_edit);
-    }
+        render_edit_text(EditRender {
+            edit: state.answer_edit,
+            rich_edit: state.rich_edit,
+            text: &rendered.text,
+            spans: &rendered.spans,
+            colors: state.colors,
+            text_height: ANSWER_FONT_TWIPS,
+            text_color: state.colors.text,
+            scroll_to_end,
+            update_now: true,
+        })
+    };
 }
 
 pub(super) unsafe fn render_plain_answer(state: &AnswerWindow) {
     let display = answer_display(&state.answer);
     let text = normalize_newlines(&display);
-    let end = text.encode_utf16().count();
     unsafe {
-        SendMessageW(state.answer_edit, WM_SETREDRAW, 0, 0);
-        SetWindowTextW(state.answer_edit, wide(&text).as_ptr());
-        if state.rich_edit {
-            SendMessageW(
-                state.answer_edit,
-                EM_SETBKGNDCOLOR,
-                0,
-                state.colors.answer_bg as LPARAM,
-            );
-            apply_base_format(state.answer_edit, end, state.colors.text);
-        }
-        SendMessageW(state.answer_edit, EM_SETSEL, end, end as LPARAM);
-        SendMessageW(state.answer_edit, EM_SCROLLCARET, 0, 0);
-        SendMessageW(state.answer_edit, WM_SETREDRAW, 1, 0);
-        InvalidateRect(state.answer_edit, null(), 0);
-    }
+        render_edit_text(EditRender {
+            edit: state.answer_edit,
+            rich_edit: state.rich_edit,
+            text: &text,
+            spans: &[],
+            colors: state.colors,
+            text_height: ANSWER_FONT_TWIPS,
+            text_color: state.colors.text,
+            scroll_to_end: true,
+            update_now: false,
+        })
+    };
 }
 
 pub(super) fn answer_display(value: &str) -> Cow<'_, str> {
@@ -81,30 +62,65 @@ pub(super) unsafe fn render_thinking(state: &AnswerWindow) {
         tail.to_owned()
     };
     let text = normalize_newlines(&text);
-    let end = text.encode_utf16().count();
     unsafe {
-        SendMessageW(state.thinking_edit, WM_SETREDRAW, 0, 0);
-        SetWindowTextW(state.thinking_edit, wide(&text).as_ptr());
-        if state.thinking_rich_edit {
+        render_edit_text(EditRender {
+            edit: state.thinking_edit,
+            rich_edit: state.thinking_rich_edit,
+            text: &text,
+            spans: &[],
+            colors: state.colors,
+            text_height: 240,
+            text_color: state.colors.dim,
+            scroll_to_end: true,
+            update_now: true,
+        })
+    };
+}
+
+struct EditRender<'a> {
+    edit: HWND,
+    rich_edit: bool,
+    text: &'a str,
+    spans: &'a [MarkdownSpan],
+    colors: AnswerColors,
+    text_height: i32,
+    text_color: u32,
+    scroll_to_end: bool,
+    update_now: bool,
+}
+
+unsafe fn render_edit_text(render: EditRender<'_>) {
+    let wide_text = wide(render.text);
+    let end = wide_text.len() - 1;
+    unsafe {
+        SendMessageW(render.edit, WM_SETREDRAW, 0, 0);
+        SetWindowTextW(render.edit, wide_text.as_ptr());
+        if render.rich_edit {
             SendMessageW(
-                state.thinking_edit,
+                render.edit,
                 EM_SETBKGNDCOLOR,
                 0,
-                state.colors.answer_bg as LPARAM,
+                render.colors.answer_bg as LPARAM,
             );
             apply_text_format(
-                state.thinking_edit,
+                render.edit,
                 end,
-                240,
-                state.colors.dim,
+                render.text_height,
+                render.text_color,
                 "Microsoft YaHei UI",
             );
+            for span in render.spans {
+                apply_markdown_span(render.edit, span, render.colors);
+            }
         }
-        SendMessageW(state.thinking_edit, EM_SETSEL, end, end as LPARAM);
-        SendMessageW(state.thinking_edit, EM_SCROLLCARET, 0, 0);
-        SendMessageW(state.thinking_edit, WM_SETREDRAW, 1, 0);
-        InvalidateRect(state.thinking_edit, null(), 0);
-        UpdateWindow(state.thinking_edit);
+        let caret = if render.scroll_to_end { end } else { 0 };
+        SendMessageW(render.edit, EM_SETSEL, caret, caret as LPARAM);
+        SendMessageW(render.edit, EM_SCROLLCARET, 0, 0);
+        SendMessageW(render.edit, WM_SETREDRAW, 1, 0);
+        InvalidateRect(render.edit, null(), 0);
+        if render.update_now {
+            UpdateWindow(render.edit);
+        }
     }
 }
 
@@ -124,18 +140,6 @@ pub(super) fn reasoning_tail(value: &str, max_chars: usize) -> (&str, bool) {
     }
 }
 
-unsafe fn apply_base_format(edit: HWND, end: usize, text_color: u32) {
-    unsafe {
-        apply_text_format(
-            edit,
-            end,
-            ANSWER_FONT_TWIPS,
-            text_color,
-            "Microsoft YaHei UI",
-        )
-    };
-}
-
 unsafe fn apply_text_format(edit: HWND, end: usize, height: i32, color: u32, face: &str) {
     let mut format = char_format(
         CFM_BOLD | CFM_ITALIC | CFM_UNDERLINE | CFM_STRIKEOUT | CFM_COLOR | CFM_SIZE | CFM_FACE,
@@ -143,7 +147,7 @@ unsafe fn apply_text_format(edit: HWND, end: usize, height: i32, color: u32, fac
     );
     format.height = height;
     format.text_color = color;
-    set_face(&mut format, face);
+    copy_wide(face, &mut format.face_name);
     unsafe {
         SendMessageW(edit, EM_SETSEL, 0, end as LPARAM);
         SendMessageW(
@@ -156,7 +160,7 @@ unsafe fn apply_text_format(edit: HWND, end: usize, height: i32, color: u32, fac
 }
 
 unsafe fn apply_markdown_span(edit: HWND, span: &MarkdownSpan, colors: AnswerColors) {
-    let mut format = match span.style {
+    let format = match span.style {
         MarkdownStyle::Heading(level) => {
             let mut format = char_format(CFM_BOLD | CFM_SIZE | CFM_COLOR, CFE_BOLD);
             format.height = match level {
@@ -176,7 +180,7 @@ unsafe fn apply_markdown_span(edit: HWND, span: &MarkdownSpan, colors: AnswerCol
         MarkdownStyle::Code => {
             let mut format = char_format(CFM_FACE | CFM_COLOR, 0);
             format.text_color = colors.code;
-            set_face(&mut format, "Consolas");
+            copy_wide("Consolas", &mut format.face_name);
             format
         }
         MarkdownStyle::Quote => {
@@ -190,7 +194,6 @@ unsafe fn apply_markdown_span(edit: HWND, span: &MarkdownSpan, colors: AnswerCol
             format
         }
     };
-    format.cb_size = std::mem::size_of::<CharFormatW>() as u32;
     unsafe {
         SendMessageW(edit, EM_SETSEL, span.start, span.end as LPARAM);
         SendMessageW(
@@ -213,15 +216,5 @@ fn char_format(mask: u32, effects: u32) -> CharFormatW {
         charset: DEFAULT_CHARSET,
         pitch_and_family: FF_DONTCARE,
         face_name: [0; 32],
-    }
-}
-
-fn set_face(format: &mut CharFormatW, face: &str) {
-    for (destination, source) in format
-        .face_name
-        .iter_mut()
-        .zip(face.encode_utf16().chain(Some(0)))
-    {
-        *destination = source;
     }
 }

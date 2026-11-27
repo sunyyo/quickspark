@@ -15,21 +15,21 @@ use crate::{
     storage::{AiConfig, ai_config_file, load_ai_config, load_ai_config_from},
 };
 
-use super::{Provider, ProviderContext, ProviderOutput};
+use super::{
+    Provider, ProviderContext, ProviderOutput, lock, split_first_term, strip_keyword_prefix,
+    truncate_chars,
+};
 
 mod agent;
 mod tavily;
 mod transport;
 
 const PROVIDER_ID: &str = "ai";
-const ANSWER_LABEL: &str = "AI 回答";
-const TRANSLATION_LABEL: &str = "AI 翻译";
 const MAX_SEARCH_ROUNDS: usize = 3;
 const MAX_SEARCH_QUERIES: usize = 6;
 const MAX_SEARCH_SOURCES: usize = 12;
 const MAX_SEARCH_CONTEXT_CHARS: usize = 20_000;
 const MAX_AGENT_DURATION: Duration = Duration::from_secs(120);
-const AGENT_PROTOCOL_VERSION: &str = "agent-search-v2-no-sources";
 const MAX_IN_FLIGHT_REQUESTS: usize = 2;
 
 #[derive(Clone)]
@@ -67,10 +67,6 @@ pub(crate) enum AiEvent {
     },
 }
 
-pub(crate) struct AiProvider {
-    service: AiService,
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct AiResponse {
     answer: String,
@@ -90,9 +86,10 @@ enum AiState {
     Idle,
     Loading {
         generation: u64,
-        request: AiRequest,
+        cache_key: String,
     },
     Finished {
+        cache_key: String,
         request: AiRequest,
         result: Result<AiResponse, String>,
     },
@@ -111,24 +108,18 @@ impl AiService {
         }
     }
 
-    pub(crate) fn provider(&self) -> AiProvider {
-        AiProvider {
-            service: self.clone(),
-        }
-    }
-
-    pub(crate) fn ask(&self, mut request: AiRequest) -> u64 {
+    pub(crate) fn ask(&self, request: AiRequest) -> u64 {
         if request.request_prompt.trim().is_empty() {
             return 0;
         }
         let config = load_ai_config();
-        request.cache_key = request_cache_key(&request, &config);
+        let cache_key = request_cache_key(&request, &config);
         let generation = self.generation.fetch_add(1, Ordering::AcqRel) + 1;
-        lock_events(&self.events).clear();
+        lock(&self.events).clear();
         self.notification_pending.store(false, Ordering::Release);
-        *lock_state(&self.state) = AiState::Loading {
+        *lock(&self.state) = AiState::Loading {
             generation,
-            request: request.clone(),
+            cache_key: cache_key.clone(),
         };
         if self
             .in_flight
@@ -138,8 +129,9 @@ impl AiService {
             .is_err()
         {
             let error = "已有两个 AI 请求正在安全结束，请稍后重试。".to_owned();
-            *lock_state(&self.state) = AiState::Finished {
-                request: request.clone(),
+            *lock(&self.state) = AiState::Finished {
+                cache_key,
+                request,
                 result: Err(error.clone()),
             };
             self.push_event(AiEvent::Failed { generation, error });
@@ -148,11 +140,12 @@ impl AiService {
         let service = self.clone();
         thread::spawn(move || {
             let _in_flight = InFlightGuard(Arc::clone(&service.in_flight));
-            let result = ask_openai_compatible(&request, &config, generation, &service);
+            let result = agent::run(&request, &config, generation, &service);
             if let Some(event) = finish_event_if_current(
                 &service.state,
                 &service.generation,
                 generation,
+                cache_key,
                 request,
                 result,
             ) {
@@ -164,13 +157,13 @@ impl AiService {
 
     pub(crate) fn cancel(&self) {
         self.generation.fetch_add(1, Ordering::AcqRel);
-        lock_events(&self.events).clear();
+        lock(&self.events).clear();
         self.notification_pending.store(false, Ordering::Release);
-        *lock_state(&self.state) = AiState::Idle;
+        *lock(&self.state) = AiState::Idle;
     }
 
     pub(crate) fn drain_events(&self) -> Vec<AiEvent> {
-        let mut events = lock_events(&self.events);
+        let mut events = lock(&self.events);
         let drained = events.drain(..).collect();
         // Clear while the queue lock is still held. A producer that was waiting
         // for this lock will enqueue afterwards and post the next notification.
@@ -181,7 +174,7 @@ impl AiService {
     fn push_event(&self, event: AiEvent) {
         let generation = event.generation();
         {
-            let mut events = lock_events(&self.events);
+            let mut events = lock(&self.events);
             // Cancellation and new requests increment generation before they
             // clear this queue. Re-check while holding the queue lock so a
             // producer that was already waiting cannot enqueue a stale event
@@ -224,10 +217,11 @@ fn finish_event_if_current(
     state: &Mutex<AiState>,
     current_generation: &AtomicU64,
     generation: u64,
+    cache_key: String,
     request: AiRequest,
     result: Result<AiResponse, String>,
 ) -> Option<AiEvent> {
-    let mut state = lock_state(state);
+    let mut state = lock(state);
     let still_loading = matches!(
         &*state,
         AiState::Loading {
@@ -249,7 +243,11 @@ fn finish_event_if_current(
             error: error.clone(),
         },
     };
-    *state = AiState::Finished { request, result };
+    *state = AiState::Finished {
+        cache_key,
+        request,
+        result,
+    };
     Some(event)
 }
 
@@ -273,7 +271,7 @@ impl AiEvent {
     }
 }
 
-impl Provider for AiProvider {
+impl Provider for AiService {
     fn id(&self) -> &'static str {
         PROVIDER_ID
     }
@@ -327,34 +325,33 @@ impl Provider for AiProvider {
     }
 }
 
-impl AiProvider {
-    fn request_output(&self, mut request: AiRequest) -> ProviderOutput {
+impl AiService {
+    fn request_output(&self, request: AiRequest) -> ProviderOutput {
         let config = load_ai_config();
-        request.cache_key = request_cache_key(&request, &config);
-        match &*lock_state(&self.service.state) {
+        let cache_key = request_cache_key(&request, &config);
+        match &*lock(&self.state) {
             AiState::Loading {
                 generation,
-                request: active,
-            } if active.cache_key == request.cache_key => message(
+                cache_key: active_key,
+            } if *active_key == cache_key => message(
                 &format!(
                     "{}进行中…（请求 #{generation}，按 Enter 取消）",
-                    request.result_label
+                    request.task.label()
                 ),
                 vec![Action::CancelAi],
             ),
             AiState::Finished {
+                cache_key: completed_key,
                 request: completed,
                 result: Ok(response),
-                ..
-            } if completed.cache_key == request.cache_key => ProviderOutput {
-                results: vec![answer_result(completed, response)],
-                exclusive: true,
-            },
+            } if *completed_key == cache_key => {
+                ProviderOutput::exclusive(vec![answer_result(completed, response)])
+            }
             AiState::Finished {
-                request: completed,
+                cache_key: completed_key,
                 result: Err(error),
                 ..
-            } if completed.cache_key == request.cache_key => message(
+            } if *completed_key == cache_key => message(
                 &format!("AI 请求失败：{}（按 Enter 重试）", preview(error, 80)),
                 vec![
                     Action::AskAi { request },
@@ -372,7 +369,7 @@ impl AiProvider {
                         }],
                     )
                 } else {
-                    let title = if request.result_label == TRANSLATION_LABEL {
+                    let title = if request.task == AiTask::Translation {
                         format!(
                             "使用 {} {}",
                             config.model,
@@ -411,7 +408,7 @@ impl AiProvider {
             request,
             result: Ok(response),
             ..
-        } = &*lock_state(&self.service.state)
+        } = &*lock(&self.state)
         {
             results.push(answer_result(request, response));
         }
@@ -440,10 +437,7 @@ impl AiProvider {
                 query: "ai settings".to_owned(),
             }],
         });
-        ProviderOutput {
-            results,
-            exclusive: true,
-        }
+        ProviderOutput::exclusive(results)
     }
 
     fn translation_overview(&self) -> ProviderOutput {
@@ -469,15 +463,12 @@ impl AiProvider {
             request,
             result: Ok(response),
             ..
-        } = &*lock_state(&self.service.state)
-            && request.result_label == TRANSLATION_LABEL
+        } = &*lock(&self.state)
+            && request.task == AiTask::Translation
         {
             results.push(answer_result(request, response));
         }
-        ProviderOutput {
-            results,
-            exclusive: true,
-        }
+        ProviderOutput::exclusive(results)
     }
 }
 
@@ -554,7 +545,7 @@ fn ai_settings() -> ProviderOutput {
             ResultItem {
                 provider_id: PROVIDER_ID,
                 title: "配置完成后输入 ai 问题或 tr 文本，按 Enter 发送".to_owned(),
-                score: 99_996,
+                score: 99_995,
                 actions: vec![Action::SetQuery {
                     query: "ai ".to_owned(),
                 }],
@@ -577,7 +568,7 @@ fn answer_result(request: &AiRequest, response: &AiResponse) -> ResultItem {
         provider_id: PROVIDER_ID,
         title: format!(
             "{}：{}（{view_hint}）",
-            request.result_label,
+            request.task.label(),
             preview(&response.answer, 88)
         ),
         score: 100_000,
@@ -597,42 +588,15 @@ fn answer_result(request: &AiRequest, response: &AiResponse) -> ResultItem {
 }
 
 fn message(title: &str, actions: Vec<Action>) -> ProviderOutput {
-    ProviderOutput {
-        results: vec![ResultItem {
-            provider_id: PROVIDER_ID,
-            title: title.to_owned(),
-            score: 100_000,
-            actions,
-        }],
-        exclusive: true,
-    }
+    ProviderOutput::exclusive_item(PROVIDER_ID, title, 100_000, actions)
 }
 
 fn ai_query(input: &str) -> Option<&str> {
-    let input = input.trim();
-    if input.eq_ignore_ascii_case("ai") {
-        return Some("");
-    }
-    let split = input.find(char::is_whitespace)?;
-    let (prefix, terms) = input.split_at(split);
-    prefix.eq_ignore_ascii_case("ai").then_some(terms.trim())
+    strip_keyword_prefix(input, &["ai"])
 }
 
 fn translation_query(input: &str) -> Option<&str> {
-    let input = input.trim();
-    const PREFIXES: &[&str] = &["tr", "translate", "fy", "翻译"];
-    if PREFIXES
-        .iter()
-        .any(|prefix| input.eq_ignore_ascii_case(prefix))
-    {
-        return Some("");
-    }
-    let split = input.find(char::is_whitespace)?;
-    let (prefix, terms) = input.split_at(split);
-    PREFIXES
-        .iter()
-        .any(|candidate| prefix.eq_ignore_ascii_case(candidate))
-        .then_some(terms.trim())
+    strip_keyword_prefix(input, &["tr", "translate", "fy", "翻译"])
 }
 
 fn question_request(prompt: &str) -> AiRequest {
@@ -647,10 +611,8 @@ fn question_request(prompt: &str) -> AiRequest {
     AiRequest {
         display_prompt: prompt.clone(),
         request_prompt: prompt,
-        result_label: ANSWER_LABEL.to_owned(),
         task: AiTask::Question,
         web_search,
-        cache_key: String::new(),
     }
 }
 
@@ -659,15 +621,12 @@ fn translation_request(terms: &str) -> Option<AiRequest> {
     if terms.is_empty() {
         return None;
     }
-    let (target, source) = if terms == "--to" || terms.starts_with("--to ") {
-        let target_and_source = terms.strip_prefix("--to")?.trim_start();
-        let (language, source) = split_first_term(target_and_source);
-        let target = translation_language(language)?;
-        if source.is_empty() {
-            return None;
-        }
-        (Some(target), source)
-    } else if let Some(target_and_source) = terms.strip_prefix("->") {
+    let explicit_target = if terms == "--to" || terms.starts_with("--to ") {
+        terms.strip_prefix("--to")
+    } else {
+        terms.strip_prefix("->")
+    };
+    let (target, source) = if let Some(target_and_source) = explicit_target {
         let (language, source) = split_first_term(target_and_source.trim_start());
         let target = translation_language(language)?;
         if source.is_empty() {
@@ -707,24 +666,14 @@ fn translation_request(terms: &str) -> Option<AiRequest> {
     Some(AiRequest {
         display_prompt,
         request_prompt,
-        result_label: TRANSLATION_LABEL.to_owned(),
         task: AiTask::Translation,
         web_search: WebSearchMode::Disabled,
-        cache_key: String::new(),
     })
-}
-
-fn split_first_term(value: &str) -> (&str, &str) {
-    value
-        .find(char::is_whitespace)
-        .map_or((value, ""), |split| {
-            (&value[..split], value[split..].trim())
-        })
 }
 
 fn request_cache_key(request: &AiRequest, config: &AiConfig) -> String {
     format!(
-        "{:?}\u{1f}{:?}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        "{:?}\u{1f}{:?}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
         request.task,
         request.web_search,
         request.request_prompt,
@@ -734,7 +683,6 @@ fn request_cache_key(request: &AiRequest, config: &AiConfig) -> String {
         config.max_tokens,
         config.thinking_mode.key(),
         config.reasoning_effort.key(),
-        AGENT_PROTOCOL_VERSION,
     )
 }
 
@@ -756,33 +704,7 @@ fn matches_ci(value: &str, candidates: &[&str]) -> bool {
 
 fn preview(value: &str, limit: usize) -> String {
     let flattened = value.split_whitespace().collect::<Vec<_>>().join(" ");
-    let mut chars = flattened.chars();
-    let mut output = chars.by_ref().take(limit).collect::<String>();
-    if chars.next().is_some() {
-        output.push('…');
-    }
-    output
-}
-
-fn lock_state(state: &Mutex<AiState>) -> std::sync::MutexGuard<'_, AiState> {
-    state
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn lock_events(events: &Mutex<VecDeque<AiEvent>>) -> std::sync::MutexGuard<'_, VecDeque<AiEvent>> {
-    events
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn ask_openai_compatible(
-    request: &AiRequest,
-    config: &AiConfig,
-    generation: u64,
-    service: &AiService,
-) -> Result<AiResponse, String> {
-    agent::run(request, config, generation, service)
+    truncate_chars(&flattened, limit)
 }
 
 #[cfg(test)]

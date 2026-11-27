@@ -7,7 +7,7 @@ use std::{
 };
 
 use super::{
-    AiResponse, AiState, StreamDelta, ai_query, finish_event_if_current, lock_state, preview,
+    AiResponse, AiState, StreamDelta, ai_query, finish_event_if_current, lock, preview,
     question_request, request_cache_key, translation_query, translation_request,
     transport::{
         RequestContext, SseDecoder, StreamFrame, agent_request_body, extract_response,
@@ -95,7 +95,7 @@ fn builds_automatic_and_explicit_translation_requests() {
     assert!(automatic.request_prompt.contains("母语者习惯"));
     assert!(automatic.request_prompt.contains("避免逐字直译"));
     assert!(automatic.request_prompt.contains("保持原文的语气"));
-    assert_eq!(automatic.result_label, "AI 翻译");
+    assert_eq!(automatic.task.label(), "AI 翻译");
 
     let japanese = translation_request("日本語の文章です").unwrap();
     assert_eq!(
@@ -210,6 +210,10 @@ fn extracts_string_and_structured_answers_and_api_errors() {
         extract_response(br#"{"error":{"message":"bad key"}}"#).unwrap_err(),
         "bad key"
     );
+    assert_eq!(
+        extract_response(br#"{"error":"flat error"}"#).unwrap_err(),
+        "flat error"
+    );
 }
 
 #[test]
@@ -239,17 +243,16 @@ fn cancelled_request_context_stops_before_opening_a_connection() {
     context
         .current_generation
         .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-    let error = winhttp_stream_json(&config, "", &request, context, |_| {}).unwrap_err();
+    let error = winhttp_stream_json(&config, "", &request, &context, |_| {}).unwrap_err();
     assert_eq!(error, "AI 请求已取消");
 }
 
 #[test]
 fn stale_completion_cannot_overwrite_a_newer_loading_request() {
     let old_request = question_request("旧问题");
-    let new_request = question_request("新问题");
     let state = Mutex::new(AiState::Loading {
         generation: 2,
-        request: new_request.clone(),
+        cache_key: "new-key".to_owned(),
     });
     let generation = AtomicU64::new(2);
 
@@ -257,6 +260,7 @@ fn stale_completion_cannot_overwrite_a_newer_loading_request() {
         &state,
         &generation,
         1,
+        "old-key".to_owned(),
         old_request,
         Ok(AiResponse {
             answer: "迟到的回答".to_owned(),
@@ -266,13 +270,13 @@ fn stale_completion_cannot_overwrite_a_newer_loading_request() {
     );
 
     assert!(event.is_none());
-    let state = lock_state(&state);
+    let state = lock(&state);
     assert!(matches!(
         &*state,
         AiState::Loading {
             generation: 2,
-            request,
-        } if request == &new_request
+            cache_key,
+        } if cache_key == "new-key"
     ));
 }
 
@@ -288,11 +292,17 @@ fn terminal_events_keep_full_results_in_the_service_cache() {
     for result in [Ok(response.clone()), Err("连接中断".to_owned())] {
         let state = Mutex::new(AiState::Loading {
             generation: 7,
-            request: request.clone(),
+            cache_key: "key-7".to_owned(),
         });
-        let event =
-            finish_event_if_current(&state, &generation, 7, request.clone(), result.clone())
-                .unwrap();
+        let event = finish_event_if_current(
+            &state,
+            &generation,
+            7,
+            "key-7".to_owned(),
+            request.clone(),
+            result.clone(),
+        )
+        .unwrap();
         match (&event, &result) {
             (
                 super::AiEvent::Finished {
@@ -311,9 +321,19 @@ fn terminal_events_keep_full_results_in_the_service_cache() {
             _ => panic!("unexpected terminal event: {event:?}"),
         }
         assert!(
-            matches!(&*lock_state(&state), AiState::Finished { request: saved, result: cached } if saved == &request && cached == &result)
+            matches!(&*lock(&state), AiState::Finished { cache_key, request: saved, result: cached } if cache_key == "key-7" && saved == &request && cached == &result)
         );
-        assert!(finish_event_if_current(&state, &generation, 7, request.clone(), result).is_none());
+        assert!(
+            finish_event_if_current(
+                &state,
+                &generation,
+                7,
+                "key-7".to_owned(),
+                request.clone(),
+                result
+            )
+            .is_none()
+        );
     }
 }
 
@@ -364,6 +384,58 @@ fn decodes_sse_across_arbitrary_network_chunks() {
     );
 }
 
+struct TestHttpServer {
+    address: std::net::SocketAddr,
+    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<thread::JoinHandle<()>>,
+}
+
+impl TestHttpServer {
+    fn spawn(handler: impl FnOnce(std::net::TcpStream) + Send + 'static) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let address = listener.local_addr().unwrap();
+        let cancelled = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cancelled_flag = std::sync::Arc::clone(&cancelled);
+        let handle = thread::spawn(move || {
+            let Ok((stream, _)) = listener.accept() else {
+                return;
+            };
+            if cancelled_flag.load(std::sync::atomic::Ordering::Acquire) {
+                return;
+            }
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(5)));
+            handler(stream);
+        });
+        Self {
+            address,
+            cancelled,
+            handle: Some(handle),
+        }
+    }
+
+    fn address(&self) -> std::net::SocketAddr {
+        self.address
+    }
+
+    fn join(mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.join().unwrap();
+        }
+    }
+}
+
+impl Drop for TestHttpServer {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            self.cancelled
+                .store(true, std::sync::atomic::Ordering::Release);
+            let _ = std::net::TcpStream::connect_timeout(&self.address, Duration::from_millis(200));
+            let _ = handle.join();
+        }
+    }
+}
+
 #[test]
 fn posts_to_a_local_openai_compatible_endpoint() {
     for (ending, expected) in [
@@ -379,13 +451,7 @@ fn posts_to_a_local_openai_compatible_endpoint() {
             AiCompletion::Interrupted,
         ),
     ] {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(3)))
-                .unwrap();
+        let server = TestHttpServer::spawn(move |mut stream| {
             let request = read_http_request(&mut stream);
             let request = String::from_utf8_lossy(&request);
             assert!(request.starts_with("POST /v1/chat/completions HTTP/1.1"));
@@ -408,11 +474,12 @@ fn posts_to_a_local_openai_compatible_endpoint() {
             write!(
                 stream,
                 "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {size}\r\nConnection: close\r\n\r\n{body}"
-            ).unwrap();
+            )
+            .unwrap();
             stream.flush().unwrap();
         });
         let config = AiConfig {
-            api_url: format!("http://{address}/v1/chat/completions"),
+            api_url: format!("http://{}/v1/chat/completions", server.address()),
             model: "local-test".to_owned(),
             system_prompt: String::new(),
             max_tokens: 32,
@@ -425,7 +492,7 @@ fn posts_to_a_local_openai_compatible_endpoint() {
             &config,
             "test-key",
             &request,
-            RequestContext::standalone(),
+            &RequestContext::standalone(),
             |delta| deltas.push(delta),
         )
         .unwrap();
@@ -448,19 +515,13 @@ fn posts_to_a_local_openai_compatible_endpoint() {
                 StreamDelta::Answer("测试成功".to_owned()),
             ]
         );
-        server.join().unwrap();
+        server.join();
     }
 }
 
 #[test]
 fn posts_bearer_authenticated_json_to_a_local_search_endpoint() {
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
+    let server = TestHttpServer::spawn(|mut stream| {
         let request = read_http_request(&mut stream);
         let request = String::from_utf8_lossy(&request);
         assert!(request.starts_with("POST /search HTTP/1.1"));
@@ -478,16 +539,16 @@ fn posts_bearer_authenticated_json_to_a_local_search_endpoint() {
     });
 
     let response = winhttp_json(
-        &format!("http://{address}/search"),
+        &format!("http://{}/search", server.address()),
         "tavily-test-key",
         br#"{"query":"rust"}"#,
         5,
-        RequestContext::standalone(),
+        &RequestContext::standalone(),
         "Tavily",
     )
     .unwrap();
     assert_eq!(response, br#"{"results":[]}"#);
-    server.join().unwrap();
+    server.join();
 }
 
 #[test]
@@ -496,13 +557,7 @@ fn refuses_redirects_instead_of_forwarding_bearer_credentials() {
         let redirected = TcpListener::bind("127.0.0.1:0").unwrap();
         redirected.set_nonblocking(true).unwrap();
         let redirected_address = redirected.local_addr().unwrap();
-        let initial = TcpListener::bind("127.0.0.1:0").unwrap();
-        let initial_address = initial.local_addr().unwrap();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = initial.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(3)))
-                .unwrap();
+        let server = TestHttpServer::spawn(move |mut stream| {
             let request = read_http_request(&mut stream);
             assert!(
                 String::from_utf8_lossy(&request)
@@ -510,15 +565,15 @@ fn refuses_redirects_instead_of_forwarding_bearer_credentials() {
                     .contains("authorization: bearer redirect-secret")
             );
             write!(
-            stream,
-            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{redirected_address}/stolen\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-        )
-        .unwrap();
+                stream,
+                "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{redirected_address}/stolen\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
             stream.flush().unwrap();
         });
 
         let config = AiConfig {
-            api_url: format!("http://{initial_address}/v1/chat/completions"),
+            api_url: format!("http://{}/v1/chat/completions", server.address()),
             model: "local-test".to_owned(),
             system_prompt: String::new(),
             max_tokens: 32,
@@ -531,7 +586,7 @@ fn refuses_redirects_instead_of_forwarding_bearer_credentials() {
                 &config,
                 "redirect-secret",
                 &request,
-                RequestContext::standalone(),
+                &RequestContext::standalone(),
                 |_| {},
             )
             .unwrap_err()
@@ -541,13 +596,13 @@ fn refuses_redirects_instead_of_forwarding_bearer_credentials() {
                 "redirect-secret",
                 &request,
                 5,
-                RequestContext::standalone(),
+                &RequestContext::standalone(),
                 "Tavily",
             )
             .unwrap_err()
         };
         assert!(error.contains("HTTP 307"), "unexpected error: {error}");
-        server.join().unwrap();
+        server.join();
         assert!(matches!(
             redirected.accept(),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock
@@ -562,13 +617,7 @@ fn streaming_sse_enforces_decoded_limit_instead_of_4mb_wire_envelope() {
         "x".repeat(80)
     );
     let repeat = (4 * 1024 * 1024 / frame.len()) + 50;
-    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-    let address = listener.local_addr().unwrap();
-    let server = thread::spawn(move || {
-        let (mut stream, _) = listener.accept().unwrap();
-        stream
-            .set_read_timeout(Some(Duration::from_secs(3)))
-            .unwrap();
+    let server = TestHttpServer::spawn(move |mut stream| {
         let _ = read_http_request(&mut stream);
         // Each SSE frame has ~310 bytes of JSON envelope around a 1-byte token,
         // exceeding 4 MB raw wire traffic while decoded text stays tiny (~14 KB).
@@ -595,7 +644,7 @@ fn streaming_sse_enforces_decoded_limit_instead_of_4mb_wire_envelope() {
     });
 
     let config = AiConfig {
-        api_url: format!("http://{address}/v1/chat/completions"),
+        api_url: format!("http://{}/v1/chat/completions", server.address()),
         model: "local-test".to_owned(),
         system_prompt: String::new(),
         max_tokens: 32,
@@ -607,13 +656,13 @@ fn streaming_sse_enforces_decoded_limit_instead_of_4mb_wire_envelope() {
         &config,
         "test-key",
         &body,
-        RequestContext::standalone(),
+        &RequestContext::standalone(),
         |_| {},
     )
     .unwrap();
     assert_eq!(response.completion, AiCompletion::Complete);
     assert_eq!(response.answer.len(), repeat);
-    server.join().unwrap();
+    server.join();
 }
 
 #[test]
@@ -628,7 +677,7 @@ fn rejects_control_characters_in_bearer_api_key() {
         &config,
         "bad-key\r\nX-Injected: 1",
         &body,
-        RequestContext::standalone(),
+        &RequestContext::standalone(),
         |_| {},
     )
     .unwrap_err();
